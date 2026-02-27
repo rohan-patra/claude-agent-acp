@@ -1,5 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { FileEditInput, FileReadInput, FileWriteInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import {
+  FileEditInput,
+  FileReadInput,
+  FileWriteInput,
+} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { z } from "zod";
 import { CLAUDE_CONFIG_DIR, ClaudeAcpAgent } from "./acp-agent.js";
 import { ClientCapabilities, ReadTextFileResponse } from "@agentclientprotocol/sdk";
@@ -189,16 +193,20 @@ Usage:
           };
         }
 
-        // For existing files, enforce read-before-write
+        // For existing files, enforce read-before-write.
+        // New files (that don't exist yet) skip this check entirely.
+        let existingContent: string | undefined;
         try {
           const existing = await readTextFile({ file_path: input.file_path });
           if (typeof existing?.content === "string") {
-            assertFileReadAndCurrent(input.file_path, existing.content);
+            existingContent = existing.content;
           }
-        } catch (e) {
-          // If the file doesn't exist yet (new file), skip the check
-          if (e instanceof Error && e.message.includes("must read")) throw e;
-          if (e instanceof Error && e.message.includes("has been modified")) throw e;
+        } catch {
+          // File doesn't exist — this is a new file, no guard needed
+        }
+
+        if (existingContent !== undefined) {
+          assertFileReadAndCurrent(input.file_path, existingContent);
         }
 
         await writeTextFile(input);
