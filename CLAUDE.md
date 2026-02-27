@@ -12,136 +12,134 @@ The MCP server was removed because it had critical bugs:
 - Image/binary file handling was broken
 - Claude Code's `.claude/settings.json` permissions were bypassed
 
-This fork adds back a simplified MCP server that fixes all of those bugs.
+This fork restores the Review Changes UI using a **PostToolUse intercept** pattern instead of an MCP server, which fixes all of those bugs.
 
 ## What This Fork Changes
 
-All changes are additive — no upstream code is modified in a breaking way. The fork adds **one new file** and makes **small additions** to three existing files.
-
-### New File: `src/mcp-server.ts`
-
-An in-process MCP server that registers two tools under the `mcp__acp__` namespace.
-
-`createMcpServer()` returns a `McpServerResult` containing:
-- **`server`** — The `McpServer` instance registered with the Claude Agent SDK
-- **`onFileRead(filePath)`** — Callback to invoke when Claude reads a file (via PostToolUse on the built-in Read tool). Caches the file content for staleness detection.
-
-Registered tools:
-- **`mcp__acp__Write`** — Writes files via `agent.client.writeTextFile()`, which triggers Zed's Review Changes UI. For existing files, enforces read-before-write and staleness checks.
-- **`mcp__acp__Edit`** — Reads current content via ACP, enforces read-before-edit and staleness checks, applies `str_replace`, writes via ACP, returns a unified diff. After a successful edit, the cache is updated with the new content so consecutive edits to the same file don't require re-reading.
-
-Key design decisions:
-- **No Read tool** — Claude uses its built-in Read tool. Only write operations need ACP routing for the Review UI.
-- **No Bash/terminal tools** — These work fine with built-in tools + PostToolUse hooks. Including them in the old MCP server was the root cause of the subagent bug (subagents couldn't access MCP tools).
-- **No custom permissions** — Relies entirely on Claude Code's built-in `canUseTool` and `.claude/settings.json`.
-- **Internal paths bypass ACP** — Paths under `~/.claude/` (except settings files) go directly to the filesystem so agent state persistence works.
-- **Read-before-edit guard** — Enforces that Claude must read a file before editing it, and that the file hasn't changed since the last read. This matches the native Claude Code Edit tool behavior and prevents edits based on stale context. The guard is powered by a `fileContentCache` inside the MCP server closure, populated via a PostToolUse hook on the built-in Read tool. After a successful edit/write, the cache is updated with the new content so consecutive edits don't require re-reading.
-- **Edit uniqueness check** — Throws if `old_string` matches multiple times (unless `replace_all` is set), matching the built-in Edit tool behavior.
-- Uses `diff.createPatch()` from the `diff` npm package for unified diff output (same as the old v0.17.1 server).
-
-### Modified: `src/acp-agent.ts`
-
-Three additions in `createSession()`:
-
-1. **MCP server registration**: When `clientCapabilities.fs.writeTextFile` is available, creates and registers the in-process MCP server as `mcpServers["acp"]` with `type: "sdk"`. The `onFileRead` callback from the MCP server is captured and wired to the PostToolUse hook. Placed before client-provided MCP servers so they can override if needed.
-
-2. **System prompt append**: Calls `buildToolRedirectPrompt()` to programmatically generate instructions from `toolRedirects`, telling Claude to use `mcp__acp__Edit`/`mcp__acp__Write` from the start of the session. Ensures Claude uses the correct tools on the first edit without a failed attempt.
-
-3. **PreToolUse hook registration**: Derives the matcher pattern from `Object.keys(toolRedirects).join("|")` and registers `createPreToolUseHook()` as a safety net. If Claude ignores the system prompt and tries the built-in Edit/Write, the hook denies it with a redirect message.
-
-4. **PostToolUse `onFileRead` wiring**: Passes the MCP server's `onFileRead` callback to `createPostToolUseHook()` so that when the built-in Read tool completes, the file content is cached for staleness detection.
-
-New imports at top of file:
-```typescript
-import { createPreToolUseHook, buildToolRedirectPrompt, toolRedirects } from "./tools.js";
-import { createMcpServer } from "./mcp-server.js";
-```
+All changes are additive — no upstream code is modified in a breaking way. The fork makes **small additions** to three existing files.
 
 ### Modified: `src/tools.ts`
 
-Additions:
+Additions appended at end of file:
 
-1. **`import { acpToolNames } from "./mcp-server.js"`** — Imports the MCP tool name constants.
+1. **Imports** — `fs`, `path`, `diff`, and `CLAUDE_CONFIG_DIR` from `./acp-agent.js`.
 
-2. **`toolInfoFromToolUse()` cases** — Added `acpToolNames.write` and `acpToolNames.edit` as fallthrough cases alongside `"Write"` and `"Edit"` so MCP tool calls get proper diff/location rendering in Zed's UI.
+2. **`internalPath(filePath)`** — Returns `true` for paths under `~/.claude/` (except `settings.json` and `session-env`). These bypass ACP interception so agent state persistence works.
 
-3. **`toolUpdateFromToolResult()` cases** — Added `acpToolNames.write` and `acpToolNames.edit` alongside `"Write"` and `"Edit"` so MCP tool results return `{}` (handled by hooks).
+3. **`applyEditContent(fileContent, oldString, newString, replaceAll?)`** — Pure string replacement logic extracted from the Edit tool. Returns just the new content string (no patch computation). Validates that `old_string` is non-empty, exists in the file, and is unique (unless `replace_all` is set).
 
-4. **`toolRedirects`** — A `Record<string, string>` mapping built-in tool names to their `mcp__acp__` equivalents. Single source of truth consumed by the system prompt builder, the PreToolUse hook, and the hook matcher pattern.
+4. **`applyEdit(fileContent, filePath, oldString, newString, replaceAll?)`** — Wraps `applyEditContent` and adds a unified diff via `diff.createPatch()`. Used by `toolUpdateFromEditToolResponse` for Zed's diff display.
 
-5. **`buildToolRedirectPrompt()`** — Programmatically generates a system prompt append string from `toolRedirects`. Adding a new tool redirect only requires adding an entry to `toolRedirects`.
+5. **`extractReadContent(toolResponse)`** — Extracts file content directly from the Read tool's `tool_response` string, avoiding a redundant ACP round-trip.
 
-6. **`createPreToolUseHook()`** — A `HookCallback` that looks up `toolRedirects[tool_name]` and denies with a redirect message if found. Uses strict equality on `tool_name` so it won't accidentally match `mcp__acp__Write`.
+6. **`isToolError(toolResponse)`** — Checks if a tool response indicates an error (the response contains `is_error: true`).
 
-7. **`createPostToolUseHook()` `onFileRead` option** — Extended with an optional `onFileRead` callback that fires when the built-in Read tool completes. This feeds the MCP server's `fileContentCache` so Edit/Write can enforce read-before-edit and detect stale content.
+7. **`FileEditInterceptor` interface** — Two methods:
+   - `onFileRead(filePath, content)` — Caches file content when Read completes.
+   - `interceptEditWrite(toolName, toolInput, toolResponse, writeTextFile)` — Reverts the disk write and routes through ACP.
+
+8. **`createFileEditInterceptor(logger)`** — Factory that returns a `FileEditInterceptor`. Contains a `fileContentCache` Map in its closure. The interceptor:
+   - Lets the built-in Edit/Write tool execute normally (writing to disk)
+   - Determines the new content (from `applyEditContent` for Edit, from `input.content` for Write)
+   - Reverts the file to its pre-edit state (or skips revert for uncached files)
+   - Routes the new content through `writeTextFile` → Zed's Review Changes UI
+   - Updates the cache for consecutive edits
+
+9. **`createPostToolUseHook()` `onFileRead` option** — Extended with an optional `onFileRead(filePath, content)` callback that fires when the built-in Read tool completes, feeding the interceptor's cache via `extractReadContent`.
+
+Key design decisions:
+- **PostToolUse intercept, not MCP** — Built-in Edit/Write execute normally, then the PostToolUse hook intercepts, reverts, and routes through ACP. This works for both main sessions and subagents (subagents use built-in tools directly, which the PostToolUse hook can intercept).
+- **No system prompt or PreToolUse hook needed** — Claude uses its built-in Edit/Write tools naturally. No tool redirection or MCP tool names to worry about.
+- **No `@modelcontextprotocol/sdk` dependency** — The MCP server is gone entirely.
+- **Internal paths bypass ACP** — Paths under `~/.claude/` (except settings files) go directly to the filesystem.
+- **Read-before-edit guard** — The `fileContentCache` enables staleness detection. If a file was read and then modified externally before Claude edits it, the interceptor uses the cached content for `applyEditContent` and reverts to the cached version. Uncached files fall back to reading the new content from disk and skip revert.
+- **Cache update after edit** — After a successful ACP route, the cache is updated with the new content so consecutive edits to the same file work without re-reading.
+
+### Modified: `src/acp-agent.ts`
+
+Changes in `createSession()`:
+
+1. **`FileEditInterceptor` creation**: When `clientCapabilities.fs.writeTextFile` is available, calls `createFileEditInterceptor(this.logger)` and stores the result on the session object.
+
+2. **PostToolUse `onFileRead` wiring**: Passes `fileEditInterceptor.onFileRead` to `createPostToolUseHook()` so that when the built-in Read tool completes, `extractReadContent` extracts the file content and caches it.
+
+Changes in `toAcpNotifications()` and `streamEventToAcpNotifications()`:
+
+3. **`fileEditInterceptor` option**: Both functions accept an optional `fileEditInterceptor` in their options. In the `onPostToolUseHook` callback, if the tool is Edit or Write, the interceptor's `interceptEditWrite` is called with `client.writeTextFile` before the normal notification logic runs.
+
+New imports at top of file:
+```typescript
+import { createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
+```
+
+Session type addition:
+```typescript
+fileEditInterceptor?: FileEditInterceptor;
+```
 
 ### Modified: `src/lib.ts`
 
 Added exports:
 ```typescript
-export { ..., createPreToolUseHook, buildToolRedirectPrompt, toolRedirects } from "./tools.js";
-export { createMcpServer, acpToolNames } from "./mcp-server.js";
+export { ..., createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
 ```
 
 ### Modified: `package.json`
 
-Added runtime dependencies:
-- `@modelcontextprotocol/sdk` — For `McpServer` class used by the in-process MCP server
-- `diff` — For `diff.createPatch()` in the Edit tool
+- `diff` — For `diff.createPatch()` in `applyEdit`
 - `@types/diff` (devDependency) — TypeScript types for diff
+- Removed `@modelcontextprotocol/sdk` (no longer needed)
 
 ## How to Merge Upstream Updates
 
 When pulling changes from `zed-industries/claude-agent-acp`:
 
-1. **`src/mcp-server.ts`** — This file doesn't exist upstream, so it will never conflict.
+1. **`src/acp-agent.ts`** — Our changes are two isolated insertion blocks:
+   - `createFileEditInterceptor` block (~5 lines in `createSession()` after capabilities check)
+   - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
+   - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
 
-2. **`src/acp-agent.ts`** — Our changes are three isolated insertion blocks:
-   - MCP server registration block (~10 lines after `const mcpServers = {}`)
-   - System prompt append block (~5 lines after the `systemPrompt` config)
-   - PreToolUse hook block (~12 lines inside the `hooks: {}` config)
+   If upstream modifies `createSession()`, these blocks just need to stay in the same logical positions.
 
-   If upstream modifies `createSession()`, these blocks just need to stay in the same logical positions. The MCP server block goes after the `mcpServers` variable declaration. The system prompt block goes after the existing `systemPrompt` handling. The PreToolUse block goes inside the `hooks` object alongside `PostToolUse`.
+2. **`src/tools.ts`** — Our changes are:
+   - Import additions at the top (`fs`, `path`, `diff`, `CLAUDE_CONFIG_DIR`)
+   - `internalPath`, `applyEditContent`, `applyEdit`, `extractReadContent`, `isToolError`, `FileEditInterceptor`, `createFileEditInterceptor` appended at end of file
+   - `onFileRead` option added to `createPostToolUseHook`
 
-3. **`src/tools.ts`** — Our changes are:
-   - One import line at the top
-   - Three `case` fallthrough additions in switch statements (adding `acpToolNames.write`/`acpToolNames.edit` next to `"Write"`/`"Edit"`)
-   - `toolRedirects`, `buildToolRedirectPrompt`, and `createPreToolUseHook` appended at end of file
+   If upstream adds new tool handling, our additions are all at the end of the file and shouldn't conflict.
 
-   If upstream adds new tool handling in `toolInfoFromToolUse` or `toolUpdateFromToolResult`, just ensure the `acpToolNames` cases stay paired with their built-in equivalents.
+3. **`src/lib.ts`** — Export lines. Straightforward to re-add if upstream modifies exports.
 
-4. **`src/lib.ts`** — Export lines. Straightforward to re-add if upstream modifies exports.
-
-5. **`package.json`** — Keep `@modelcontextprotocol/sdk`, `diff`, and `@types/diff` as dependencies.
+4. **`package.json`** — Keep `diff` and `@types/diff` as dependencies.
 
 ## Architecture
 
 ```
 Zed <──ACP (ndjson/stdio)──> ClaudeAcpAgent <──Claude Agent SDK──> Claude API
                                     │
-                                    ├── MCP Server (in-process, type: "sdk")
-                                    │   ├── mcp__acp__Write → fs/write_text_file → Zed buffer → Review UI
-                                    │   └── mcp__acp__Edit  → fs/read + transform + fs/write → Review UI
+                                    ├── FileEditInterceptor (PostToolUse hook)
+                                    │   ├── Edit: applyEditContent → revert → writeTextFile → Review UI
+                                    │   └── Write: revert → writeTextFile → Review UI
                                     │
-                                    ├── System Prompt Append (from toolRedirects)
-                                    │   └── "ALWAYS use mcp__acp__Edit instead of Edit, ..."
-                                    │
-                                    └── PreToolUse Hook (safety net, from toolRedirects)
-                                        └── Denies built-in Write/Edit → redirects to mcp__acp__ tools
+                                    └── PostToolUse onFileRead (caches content for staleness detection)
 ```
 
-### Flow: Main Session Edit
-1. System prompt tells Claude to use `mcp__acp__Edit` / `mcp__acp__Write`
-2. Claude calls `mcp__acp__Edit` directly (no failed attempt)
-3. MCP server reads file via ACP, applies str_replace, writes via `fs/write_text_file`
-4. Zed shows the change in **Review Changes** multibuffer with accept/reject controls
-5. User accepts or rejects inline
+### Flow: Edit/Write (Main Session and Subagents)
+1. Claude calls the built-in Edit or Write tool
+2. The tool executes normally, writing to disk
+3. PostToolUse hook fires → `interceptEditWrite` is called
+4. Interceptor determines the new content (from cache + `applyEditContent` for Edit, from input for Write)
+5. Interceptor reverts the file to its pre-edit state on disk
+6. Interceptor routes the new content through `writeTextFile` → Zed's Review Changes UI
+7. Zed shows the change in **Review Changes** multibuffer with accept/reject controls
+8. User accepts or rejects inline
+9. Cache is updated with the new content for consecutive edits
 
-### Flow: Subagent Edit (Fallback)
-1. Subagent tries built-in Write/Edit
-2. PreToolUse hook may or may not propagate to subagents
-3. If it doesn't propagate → built-in tool works directly on disk (no review UI, but no failure)
-4. PostToolUse hook (unchanged from upstream) sends diff info to Zed for display
+### Flow: Uncached File Edit
+1. Claude edits a file it never explicitly Read (e.g., found via Grep)
+2. No cached content → interceptor reads the new content from disk (already written by built-in tool)
+3. No original content to revert to → revert is skipped
+4. New content is routed through ACP as usual
 
 ## Testing
 

@@ -4,46 +4,47 @@
 
 ## Overview
 
-This adapter connects [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to [Zed](https://zed.dev) via the [Agent Client Protocol (ACP)](https://agentclientprotocol.com). It adds an in-process MCP server that routes file Write/Edit operations through Zed's buffer system, triggering the native **Review Changes** multibuffer where users can accept or reject each edit inline.
+This adapter connects [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to [Zed](https://zed.dev) via the [Agent Client Protocol (ACP)](https://agentclientprotocol.com). It adds a transparent **PostToolUse intercept** that routes file Write/Edit operations through Zed's buffer system, triggering the native **Review Changes** multibuffer where users can accept or reject each edit inline.
 
-The upstream adapter (v0.18.0+) writes files directly to disk. This fork intercepts those writes and sends them through Zed's `fs/write_text_file` ACP API instead, so every file change gets a diff review.
+The upstream adapter (v0.18.0+) writes files directly to disk. This fork lets the built-in Edit/Write tools execute normally, then immediately reverts the file and routes the new content through Zed's `fs/write_text_file` ACP API, so every file change gets a diff review.
 
 ## How It Works
 
 ```
 Zed ◄──ACP──► ClaudeAcpAgent ◄──Claude Agent SDK──► Claude API
                     │
-                    ├── MCP Server (in-process)
-                    │   ├── mcp__acp__Write → Zed buffer → Review UI
-                    │   └── mcp__acp__Edit  → read + transform + write → Review UI
+                    ├── FileEditInterceptor (PostToolUse hook)
+                    │   ├── Edit: revert + route through ACP → Review UI
+                    │   └── Write: revert + route through ACP → Review UI
                     │
-                    ├── System Prompt (instructs Claude to use MCP tools)
-                    │
-                    └── PreToolUse Hook (safety net redirect)
+                    └── PostToolUse onFileRead (caches content for staleness detection)
 ```
 
-1. A **system prompt append** (generated from a `toolRedirects` map) tells Claude to use `mcp__acp__Edit` and `mcp__acp__Write` instead of the built-in equivalents
-2. An **in-process MCP server** handles those tools by routing writes through Zed's ACP filesystem APIs
-3. A **PreToolUse hook** acts as a safety net — if Claude still tries the built-in Edit/Write, the hook denies it with a redirect message
+1. Claude calls the **built-in Edit or Write** tool — it executes normally, writing to disk
+2. The **PostToolUse hook** fires and calls the `FileEditInterceptor`
+3. The interceptor **reverts** the file to its pre-edit state on disk
+4. The interceptor **routes** the new content through `writeTextFile` → Zed's Review Changes UI
+5. The user **accepts or rejects** the change inline
 
-All three are driven by a single `toolRedirects` record in `src/tools.ts`. Adding a new tool redirect only requires adding one entry.
+This works for both main sessions and subagents — since Claude uses its built-in tools directly, there are no MCP tool access issues.
 
 ## Background
 
 In v0.18.0 ([PR #316](https://github.com/zed-industries/claude-agent-acp/pull/316)), the upstream repo removed an earlier MCP server that provided this functionality because it had critical bugs:
 
-- **Subagent failures** — Bash/terminal MCP tools couldn't be accessed by subagents (Task tool), causing silent write failures
+- **Subagent failures** — MCP tools couldn't be accessed by subagents (Task tool), causing silent write failures
 - **Stale reads** — `mcp__acp__Read` returned outdated buffer content
 - **Binary file crashes** — Image and binary files broke the ACP text routing
 - **Permission bypass** — Custom permissions engine conflicted with Claude Code's `.claude/settings.json`
 
-This fork fixes all of those by taking a narrower approach, while also bringing the Zed editing experience closer to the native Claude Code interface:
+This fork fixes all of those by using a PostToolUse intercept instead of an MCP server:
 
 | Decision | Rationale |
 |----------|-----------|
-| **Write/Edit only** (no Read, no Bash) | Read works fine built-in. Bash MCP tools were the root cause of the subagent bug. |
-| **Read-before-edit guard** | Matches native Claude Code behavior: files must be read before editing, and edits are rejected if the file changed since the last read. Prevents edits based on stale context. |
-| **System prompt + PreToolUse hook** (not `disallowedTools`) | `disallowedTools` propagates to subagents and blocks their writes. The hook is a local safety net. |
+| **PostToolUse intercept, not MCP** | Built-in tools work everywhere (main session + subagents). No MCP tool access issues. |
+| **Write/Edit only** (no Read, no Bash) | Read works fine built-in. Only write operations need ACP routing for the Review UI. |
+| **Read-before-edit cache** | Files are cached when Read completes. Edits use the cached content for string replacement and revert. Consecutive edits work without re-reading. |
+| **No system prompt or PreToolUse hook** | Claude uses its built-in tools naturally. No tool redirection needed. |
 | **No custom permissions** | Relies on Claude Code's built-in `canUseTool` and settings files. |
 | **Internal paths bypass ACP** | `~/.claude/` paths (except settings) go direct to filesystem for agent state persistence. |
 
@@ -88,9 +89,9 @@ Everything from the upstream adapter, plus improvements that bring the Zed exper
 
 - **Edit review** — File edits appear in Zed's Review Changes multibuffer with accept/reject controls
 - **Write review** — New file creation also flows through the diff viewer
-- **Read-before-edit enforcement** — Like native Claude Code, files must be read before editing. Edits are rejected if the file has been modified since the last read, preventing changes based on stale context. The previous Zed MCP server (v0.17.1) did not have this guard.
-- **Subagent compatibility** — Subagents (Task tool) fall back to built-in tools gracefully, fixing silent failures from the previous implementation
-- **Zero failed calls** — System prompt guides Claude to the correct tools from the first edit, with a PreToolUse hook as a safety net
+- **Read-before-edit cache** — Files are cached on Read for accurate string replacement and staleness detection during edits
+- **Subagent compatibility** — Built-in tools work everywhere, fixing silent failures from the previous MCP-based implementation
+- **No tool redirection** — Claude uses its built-in Edit/Write tools naturally; the PostToolUse hook handles interception transparently
 
 All other upstream features work unchanged:
 - Context @-mentions and images
@@ -115,11 +116,10 @@ This fork is designed for easy merges. All changes are additive:
 
 | File | Change | Merge notes |
 |------|--------|-------------|
-| `src/mcp-server.ts` | **New file** | Never conflicts with upstream |
-| `src/acp-agent.ts` | 3 insertion blocks in `createSession()` | Keep blocks in same logical positions |
-| `src/tools.ts` | 1 import, 3 case fallthroughs, 3 functions at EOF | Keep `acpToolNames` cases paired with builtins |
-| `src/lib.ts` | 2 export lines | Re-add if upstream changes exports |
-| `package.json` | `@modelcontextprotocol/sdk`, `diff` deps | Keep these dependencies |
+| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications` | Keep blocks in same logical positions |
+| `src/tools.ts` | Imports, helpers, `FileEditInterceptor` interface + factory at EOF, `onFileRead` option in `createPostToolUseHook` | Additions at end of file; shouldn't conflict |
+| `src/lib.ts` | 1 export line | Re-add if upstream changes exports |
+| `package.json` | `diff` dep | Keep this dependency |
 
 See [CLAUDE.md](./CLAUDE.md) for detailed merge instructions and architecture documentation.
 

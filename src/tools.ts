@@ -62,7 +62,7 @@ type ToolResultContent =
   | BetaTextEditorCodeExecutionStrReplaceResultBlock
   | BetaTextEditorCodeExecutionToolResultError;
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import { Logger } from "./acp-agent.js";
+import { Logger, CLAUDE_CONFIG_DIR } from "./acp-agent.js";
 import {
   AgentInput,
   BashInput,
@@ -75,7 +75,9 @@ import {
   WebFetchInput,
   WebSearchInput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import { acpToolNames } from "./mcp-server.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as diff from "diff";
 
 interface ToolInfo {
   title: string;
@@ -169,8 +171,7 @@ export function toolInfoFromToolUse(
       };
     }
 
-    case "Write":
-    case acpToolNames.write: {
+    case "Write": {
       const input = toolUse.input as FileWriteInput;
       let content: ToolCallContent[] = [];
       if (input && input.file_path) {
@@ -198,8 +199,7 @@ export function toolInfoFromToolUse(
       };
     }
 
-    case "Edit":
-    case acpToolNames.edit: {
+    case "Edit": {
       const input = toolUse.input as FileEditInput;
       let content: ToolCallContent[] = [];
       if (input && input.file_path && (input.old_string || input.new_string)) {
@@ -514,9 +514,7 @@ export function toolUpdateFromToolResult(
     }
 
     case "Edit": // Edit is handled in hooks
-    case "Write":
-    case acpToolNames.edit:
-    case acpToolNames.write: {
+    case "Write": {
       return {};
     }
 
@@ -756,7 +754,7 @@ export const createPostToolUseHook =
     logger: Logger = console,
     options?: {
       onEnterPlanMode?: () => Promise<void>;
-      onFileRead?: (filePath: string) => Promise<void>;
+      onFileRead?: (filePath: string, content: string) => void;
     },
   ): HookCallback =>
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
@@ -766,9 +764,12 @@ export const createPostToolUseHook =
         await options.onEnterPlanMode();
       }
 
-      // Track file reads so the MCP Edit/Write tools can enforce read-before-edit
+      // Track file reads so Edit/Write intercept can enforce read-before-edit
       if (input.tool_name === "Read" && input.tool_input?.file_path && options?.onFileRead) {
-        await options.onFileRead(input.tool_input.file_path);
+        const content = extractReadContent(input.tool_response);
+        if (content != null) {
+          options.onFileRead(input.tool_input.file_path, content);
+        }
       }
 
       if (toolUseID) {
@@ -786,66 +787,196 @@ export const createPostToolUseHook =
   };
 
 /**
- * Tool redirects: maps built-in tool names to their mcp__acp__ equivalents.
- * Used by both the PreToolUse hook (to deny/redirect) and the system prompt
- * (to instruct Claude upfront).
+ * Checks if a given path is an internal agent persistence path.
+ * We let the agent do normal fs operations on these paths so that it can persist its state.
+ * However, we block access to settings files for security reasons.
  */
-export const toolRedirects: Record<string, string> = {
-  Write: acpToolNames.write,
-  Edit: acpToolNames.edit,
-};
-
-/**
- * Builds a system prompt append string from the registered tool redirects,
- * instructing Claude to use the MCP tools instead of the built-in equivalents.
- */
-export function buildToolRedirectPrompt(): string {
-  const entries = Object.entries(toolRedirects);
-  if (entries.length === 0) return "";
-
-  const rules = entries
-    .map(([builtin, mcp]) => `- NEVER call ${builtin}. ALWAYS call ${mcp} instead.`)
-    .join("\n");
-
-  const builtinList = entries.map(([b]) => b).join(", ");
-
+function internalPath(filePath: string): boolean {
   return (
-    "\n\n<tool-routing-rules>\n" +
-    `You MUST NOT use the built-in ${builtinList} tools. They are disabled in this environment.\n` +
-    "Instead, use the following replacements (identical input schemas):\n" +
-    rules + "\n" +
-    "These route through Zed's editor so the user can review and accept/reject changes.\n" +
-    `Calling ${builtinList} directly will be rejected. Do not attempt it.\n` +
-    "</tool-routing-rules>"
+    filePath.startsWith(CLAUDE_CONFIG_DIR) &&
+    !filePath.startsWith(path.join(CLAUDE_CONFIG_DIR, "settings.json")) &&
+    !filePath.startsWith(path.join(CLAUDE_CONFIG_DIR, "session-env"))
   );
 }
 
 /**
- * PreToolUse hook that denies built-in tools listed in `toolRedirects` with a
- * redirect message pointing Claude to the mcp__acp__ equivalents.
- *
- * Acts as a safety net — the system prompt already instructs Claude to use the
- * correct tools, but this catches any cases where it doesn't.
+ * Apply a string replacement edit and return the new content.
  */
-export const createPreToolUseHook =
-  (logger: Logger = console): HookCallback =>
-  async (input: any, _toolUseID: string | undefined): Promise<any> => {
-    if (input.hook_event_name !== "PreToolUse") return {};
+function applyEditContent(
+  fileContent: string,
+  oldString: string,
+  newString: string,
+  replaceAll?: boolean,
+): string {
+  if (oldString === "") {
+    throw new Error("The provided `old_string` is empty.\n\nNo edits were applied.");
+  }
 
-    const toolName = input.tool_name;
-    const redirect = toolRedirects[toolName];
-    if (redirect) {
-      logger.log(`[PreToolUse] Redirecting ${toolName} → ${redirect}`);
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "deny",
-          permissionDecisionReason:
-            `Use ${redirect} instead of ${toolName}. ` +
-            `The ${redirect} version routes through Zed's editor for diff review. ` +
-            `The input schema is the same.`,
-        },
-      };
+  if (replaceAll) {
+    if (!fileContent.includes(oldString)) {
+      throw new Error(
+        `The provided \`old_string\` does not appear in the file: "${oldString}".\n\nNo edits were applied.`,
+      );
     }
-    return {};
+    return fileContent.split(oldString).join(newString);
+  }
+
+  const index = fileContent.indexOf(oldString);
+  if (index === -1) {
+    throw new Error(
+      `The provided \`old_string\` does not appear in the file: "${oldString}".\n\nNo edits were applied.`,
+    );
+  }
+  // Check uniqueness
+  const secondIndex = fileContent.indexOf(oldString, index + oldString.length);
+  if (secondIndex !== -1) {
+    throw new Error(
+      `The provided \`old_string\` is not unique in the file (found multiple occurrences). ` +
+        `Either provide a larger string with more surrounding context to make it unique, ` +
+        `or use \`replace_all\` to change every instance.`,
+    );
+  }
+  return (
+    fileContent.substring(0, index) + newString + fileContent.substring(index + oldString.length)
+  );
+}
+
+/**
+ * Apply a string replacement edit and return the new content plus a unified diff.
+ */
+function applyEdit(
+  fileContent: string,
+  filePath: string,
+  oldString: string,
+  newString: string,
+  replaceAll?: boolean,
+): { newContent: string; patch: string } {
+  const newContent = applyEditContent(fileContent, oldString, newString, replaceAll);
+  const patch = diff.createPatch(filePath, fileContent, newContent);
+  return { newContent, patch };
+}
+
+/**
+ * Extracts the file content string from the Read tool's tool_response in PostToolUse.
+ */
+function extractReadContent(toolResponse: unknown): string | null {
+  if (typeof toolResponse === "string") return toolResponse;
+  if (toolResponse && typeof toolResponse === "object") {
+    if ("content" in toolResponse && typeof (toolResponse as any).content === "string") {
+      return (toolResponse as any).content;
+    }
+  }
+  return null;
+}
+
+/**
+ * Checks if the tool response indicates an error.
+ */
+function isToolError(toolResponse: unknown): boolean {
+  if (!toolResponse || typeof toolResponse !== "object") return false;
+  const resp = toolResponse as Record<string, unknown>;
+  return resp.is_error === true || resp.error != null;
+}
+
+/**
+ * Intercepts built-in Edit/Write tool calls after they execute:
+ * 1. Reverts the file to its pre-edit state on disk
+ * 2. Routes the new content through ACP writeTextFile → Zed's Review Changes UI
+ * 3. Updates the content cache for consecutive edits
+ */
+export interface FileEditInterceptor {
+  /** Cache file content when Read completes (via PostToolUse). */
+  onFileRead: (filePath: string, content: string) => void;
+  /** Revert disk write and route through ACP writeTextFile. */
+  interceptEditWrite: (
+    toolName: string,
+    toolInput: unknown,
+    toolResponse: unknown,
+    writeTextFile: (path: string, content: string) => Promise<void>,
+  ) => Promise<void>;
+}
+
+export function createFileEditInterceptor(logger: Logger): FileEditInterceptor {
+  const fileContentCache = new Map<string, string>();
+
+  return {
+    onFileRead(filePath: string, content: string): void {
+      fileContentCache.set(filePath, content);
+    },
+
+    async interceptEditWrite(toolName, toolInput, toolResponse, writeTextFile) {
+      const input = toolInput as { file_path?: string; [key: string]: unknown };
+      const filePath = input?.file_path;
+      if (!filePath) return;
+      if (internalPath(filePath)) return;
+      if (isToolError(toolResponse)) return;
+
+      const originalContent = fileContentCache.get(filePath);
+
+      // --- Determine new content ---
+      let newContent: string;
+      if (toolName === "Write") {
+        newContent = (toolInput as FileWriteInput).content;
+      } else if (toolName === "Edit") {
+        const editInput = toolInput as FileEditInput;
+        if (originalContent != null) {
+          try {
+            newContent = applyEditContent(
+              originalContent,
+              editInput.old_string,
+              editInput.new_string,
+              editInput.replace_all,
+            );
+          } catch {
+            // applyEdit failed (e.g. old_string not found) — fall back to reading disk
+            try {
+              newContent = fs.readFileSync(filePath, "utf8");
+            } catch {
+              return;
+            }
+          }
+        } else {
+          // No cached content — read from disk (tool already wrote the new content)
+          try {
+            newContent = fs.readFileSync(filePath, "utf8");
+          } catch {
+            return;
+          }
+        }
+      } else {
+        return;
+      }
+
+      // --- Revert file to pre-edit state ---
+      try {
+        if (originalContent != null) {
+          fs.writeFileSync(filePath, originalContent);
+        } else if (toolName === "Write" && !fs.existsSync(filePath)) {
+          // File didn't exist before Write created it — nothing to revert
+        } else {
+          // Uncached existing file — skip revert since we don't have the original
+        }
+      } catch (e) {
+        logger.error(`[FileEditInterceptor] Failed to revert ${filePath}: ${e}`);
+        return;
+      }
+
+      // --- Route through ACP → Zed Review UI ---
+      try {
+        await writeTextFile(filePath, newContent);
+      } catch (e) {
+        logger.error(`[FileEditInterceptor] ACP writeTextFile failed for ${filePath}: ${e}`);
+        // Restore the new content to disk so the edit isn't lost
+        try {
+          fs.writeFileSync(filePath, newContent);
+        } catch {
+          /* double failure */
+        }
+        return;
+      }
+
+      // --- Update cache for consecutive edits ---
+      fileContentCache.set(filePath, newContent);
+    },
   };
+}

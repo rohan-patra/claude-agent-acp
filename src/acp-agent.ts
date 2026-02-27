@@ -81,11 +81,9 @@ import {
   ClaudePlanEntry,
   registerHookCallback,
   createPostToolUseHook,
-  createPreToolUseHook,
-  buildToolRedirectPrompt,
-  toolRedirects,
+  createFileEditInterceptor,
+  type FileEditInterceptor,
 } from "./tools.js";
-import { createMcpServer } from "./mcp-server.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import packageJson from "../package.json" with { type: "json" };
@@ -156,6 +154,7 @@ type Session = {
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
+  fileEditInterceptor?: FileEditInterceptor;
 };
 
 type BackgroundTerminal =
@@ -582,7 +581,10 @@ export class ClaudeAcpAgent implements Agent {
               this.toolUseCache,
               this.client,
               this.logger,
-              { clientCapabilities: this.clientCapabilities },
+              {
+                clientCapabilities: this.clientCapabilities,
+                fileEditInterceptor: session.fileEditInterceptor,
+              },
             )) {
               await this.client.sessionUpdate(notification);
             }
@@ -690,6 +692,7 @@ export class ClaudeAcpAgent implements Agent {
               {
                 clientCapabilities: this.clientCapabilities,
                 parentToolUseId: message.parent_tool_use_id,
+                fileEditInterceptor: session.fileEditInterceptor,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1049,22 +1052,9 @@ export class ClaudeAcpAgent implements Agent {
     await settingsManager.initialize();
 
     const mcpServers: Record<string, McpServerConfig> = {};
-
-    // Register in-process MCP server for file operations if client supports filesystem
-    // This routes Write/Edit through Zed's buffer system, enabling the Review Changes UI
-    let mcpOnFileRead: ((filePath: string) => Promise<void>) | undefined;
+    let fileEditInterceptor: FileEditInterceptor | undefined;
     if (this.clientCapabilities?.fs?.writeTextFile) {
-      const { server: acpMcpServer, onFileRead } = createMcpServer(
-        this,
-        sessionId,
-        this.clientCapabilities,
-      );
-      mcpOnFileRead = onFileRead;
-      mcpServers["acp"] = {
-        type: "sdk",
-        name: "acp",
-        instance: acpMcpServer,
-      };
+      fileEditInterceptor = createFileEditInterceptor(this.logger);
     }
 
     if (Array.isArray(params.mcpServers)) {
@@ -1101,15 +1091,6 @@ export class ClaudeAcpAgent implements Agent {
         typeof customPrompt.append === "string"
       ) {
         systemPrompt.append = customPrompt.append;
-      }
-    }
-
-    // When the MCP server is registered, instruct Claude to use the ACP-routed tools
-    // so file edits flow through Zed's Review Changes UI
-    if (this.clientCapabilities?.fs?.writeTextFile && typeof systemPrompt === "object") {
-      const acpAppend = buildToolRedirectPrompt();
-      if (acpAppend) {
-        systemPrompt.append = systemPrompt.append ? systemPrompt.append + acpAppend : acpAppend;
       }
     }
 
@@ -1178,19 +1159,6 @@ export class ClaudeAcpAgent implements Agent {
       tools: { type: "preset", preset: "claude_code" },
       hooks: {
         ...userProvidedOptions?.hooks,
-        // PreToolUse hook redirects built-in tools to mcp__acp__ equivalents
-        // as a safety net (system prompt already instructs Claude to use them)
-        ...(this.clientCapabilities?.fs?.writeTextFile
-          ? {
-              PreToolUse: [
-                ...(userProvidedOptions?.hooks?.PreToolUse || []),
-                {
-                  matcher: Object.keys(toolRedirects).join("|"),
-                  hooks: [createPreToolUseHook(this.logger)],
-                },
-              ],
-            }
-          : {}),
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
@@ -1210,7 +1178,10 @@ export class ClaudeAcpAgent implements Agent {
                   });
                   await this.updateConfigOption(sessionId, "mode", "plan");
                 },
-                onFileRead: mcpOnFileRead,
+                onFileRead: fileEditInterceptor
+                  ? (filePath: string, content: string) =>
+                      fileEditInterceptor.onFileRead(filePath, content)
+                  : undefined,
               }),
             ],
           },
@@ -1251,6 +1222,7 @@ export class ClaudeAcpAgent implements Agent {
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
+      fileEditInterceptor,
     };
 
     const initializationResult = await q.initializationResult();
@@ -1518,6 +1490,7 @@ export function toAcpNotifications(
     registerHooks?: boolean;
     clientCapabilities?: ClientCapabilities;
     parentToolUseId?: string | null;
+    fileEditInterceptor?: FileEditInterceptor;
   },
 ): SessionNotification[] {
   const registerHooks = options?.registerHooks !== false;
@@ -1600,6 +1573,21 @@ export function toAcpNotifications(
               onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
                 const toolUse = toolUseCache[toolUseId];
                 if (toolUse) {
+                  // Intercept Edit/Write: revert disk write, route through ACP Review UI
+                  if (
+                    options?.fileEditInterceptor &&
+                    (toolUse.name === "Edit" || toolUse.name === "Write")
+                  ) {
+                    await options.fileEditInterceptor.interceptEditWrite(
+                      toolUse.name,
+                      toolInput,
+                      toolResponse,
+                      async (filePath: string, content: string) => {
+                        await client.writeTextFile({ sessionId, path: filePath, content });
+                      },
+                    );
+                  }
+
                   const editDiff =
                     toolUse.name === "Edit" ? toolUpdateFromEditToolResponse(toolResponse) : {};
                   const update: SessionNotification["update"] = {
@@ -1770,7 +1758,7 @@ export function streamEventToAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
-  options?: { clientCapabilities?: ClientCapabilities },
+  options?: { clientCapabilities?: ClientCapabilities; fileEditInterceptor?: FileEditInterceptor },
 ): SessionNotification[] {
   const event = message.event;
   switch (event.type) {
@@ -1785,6 +1773,7 @@ export function streamEventToAcpNotifications(
         {
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
+          fileEditInterceptor: options?.fileEditInterceptor,
         },
       );
     case "content_block_delta":
@@ -1798,6 +1787,7 @@ export function streamEventToAcpNotifications(
         {
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
+          fileEditInterceptor: options?.fileEditInterceptor,
         },
       );
     // No content
