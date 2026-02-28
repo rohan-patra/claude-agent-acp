@@ -62,8 +62,7 @@ type ToolResultContent =
   | BetaTextEditorCodeExecutionStrReplaceResultBlock
   | BetaTextEditorCodeExecutionToolResultError;
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import type { Logger } from "./acp-agent.js";
-import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
+import { Logger } from "./acp-agent.js";
 import {
   AgentInput,
   BashInput,
@@ -77,7 +76,6 @@ import {
   WebSearchInput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import * as fs from "node:fs";
-import * as path from "node:path";
 
 interface ToolInfo {
   title: string;
@@ -787,61 +785,6 @@ export const createPostToolUseHook =
   };
 
 /**
- * Checks if a given path is an internal agent persistence path.
- * We let the agent do normal fs operations on these paths so that it can persist its state.
- * However, we block access to settings files for security reasons.
- */
-function internalPath(filePath: string): boolean {
-  return (
-    filePath.startsWith(CLAUDE_CONFIG_DIR) &&
-    !filePath.startsWith(path.join(CLAUDE_CONFIG_DIR, "settings.json")) &&
-    !filePath.startsWith(path.join(CLAUDE_CONFIG_DIR, "session-env"))
-  );
-}
-
-/**
- * Apply a string replacement edit and return the new content.
- */
-function applyEditContent(
-  fileContent: string,
-  oldString: string,
-  newString: string,
-  replaceAll?: boolean,
-): string {
-  if (oldString === "") {
-    throw new Error("The provided `old_string` is empty.\n\nNo edits were applied.");
-  }
-
-  if (replaceAll) {
-    if (!fileContent.includes(oldString)) {
-      throw new Error(
-        `The provided \`old_string\` does not appear in the file: "${oldString}".\n\nNo edits were applied.`,
-      );
-    }
-    return fileContent.split(oldString).join(newString);
-  }
-
-  const index = fileContent.indexOf(oldString);
-  if (index === -1) {
-    throw new Error(
-      `The provided \`old_string\` does not appear in the file: "${oldString}".\n\nNo edits were applied.`,
-    );
-  }
-  // Check uniqueness
-  const secondIndex = fileContent.indexOf(oldString, index + oldString.length);
-  if (secondIndex !== -1) {
-    throw new Error(
-      `The provided \`old_string\` is not unique in the file (found multiple occurrences). ` +
-        `Either provide a larger string with more surrounding context to make it unique, ` +
-        `or use \`replace_all\` to change every instance.`,
-    );
-  }
-  return (
-    fileContent.substring(0, index) + newString + fileContent.substring(index + oldString.length)
-  );
-}
-
-/**
  * Extracts the file content string from the Read tool's tool_response in PostToolUse.
  */
 function extractReadContent(toolResponse: unknown): string | null {
@@ -894,7 +837,6 @@ export function createFileEditInterceptor(logger: Logger): FileEditInterceptor {
       const input = toolInput as { file_path?: string; [key: string]: unknown };
       const filePath = input?.file_path;
       if (!filePath) return;
-      if (internalPath(filePath)) return;
       if (isToolError(toolResponse)) return;
 
       const originalContent = fileContentCache.get(filePath);
@@ -904,30 +846,14 @@ export function createFileEditInterceptor(logger: Logger): FileEditInterceptor {
       if (toolName === "Write") {
         newContent = (toolInput as FileWriteInput).content;
       } else if (toolName === "Edit") {
-        const editInput = toolInput as FileEditInput;
-        if (originalContent != null) {
-          try {
-            newContent = applyEditContent(
-              originalContent,
-              editInput.old_string,
-              editInput.new_string,
-              editInput.replace_all,
-            );
-          } catch {
-            // applyEdit failed (e.g. old_string not found) — fall back to reading disk
-            try {
-              newContent = fs.readFileSync(filePath, "utf8");
-            } catch {
-              return;
-            }
-          }
-        } else {
-          // No cached content — read from disk (tool already wrote the new content)
-          try {
-            newContent = fs.readFileSync(filePath, "utf8");
-          } catch {
-            return;
-          }
+        // Read from disk — the built-in Edit tool already wrote the new content.
+        // If the file was modified externally since the last Read, the built-in
+        // Edit will have already failed (old_string not found) and isToolError()
+        // bails out above.
+        try {
+          newContent = fs.readFileSync(filePath, "utf8");
+        } catch {
+          return;
         }
       } else {
         return;
