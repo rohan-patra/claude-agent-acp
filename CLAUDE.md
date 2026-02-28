@@ -67,6 +67,14 @@ Changes in `toAcpNotifications()` and `streamEventToAcpNotifications()`:
 
 3. **`fileEditInterceptor` option**: Both functions accept an optional `fileEditInterceptor` in their options. In the `onPostToolUseHook` callback, if the tool is Edit or Write, the interceptor's `interceptEditWrite` is called with `client.writeTextFile` before the normal notification logic runs.
 
+Changes in `prompt()`:
+
+4. **User message echo suppression**: All `user` type messages from the SDK are skipped in the output feed. The SDK echoes back user messages, but these should not appear in Zed's agent output. Content filtering always strips `text` and `thinking` blocks (handled by stream events), regardless of message type.
+
+Changes in `canUseTool()`:
+
+5. **ExitPlanMode `bypassPermissions` option**: When `ALLOW_BYPASS` is true, the ExitPlanMode permission dialog includes a "Yes, and bypass permissions" option. Options are ordered: acceptEdits → bypassPermissions → default → plan. The outcome handler recognizes `bypassPermissions` as a valid mode transition.
+
 New imports at top of file:
 ```typescript
 import { createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
@@ -94,12 +102,14 @@ export { ..., createFileEditInterceptor, type FileEditInterceptor } from "./tool
 
 When pulling changes from `zed-industries/claude-agent-acp`:
 
-1. **`src/acp-agent.ts`** — Our changes are two isolated insertion blocks:
+1. **`src/acp-agent.ts`** — Our changes are isolated insertion blocks:
    - `createFileEditInterceptor` block (~5 lines in `createSession()` after capabilities check)
    - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
+   - User message echo suppression in `prompt()` (simplified filtering of `message.type === "user"`)
+   - ExitPlanMode `bypassPermissions` option in `canUseTool()` (conditional on `ALLOW_BYPASS`)
 
-   If upstream modifies `createSession()`, these blocks just need to stay in the same logical positions.
+   If upstream modifies `createSession()`, `prompt()`, or `canUseTool()`, these blocks just need to stay in the same logical positions.
 
 2. **`src/tools.ts`** — Our changes are:
    - Import additions at the top (`fs`, `path`, `diff`, `CLAUDE_CONFIG_DIR`)

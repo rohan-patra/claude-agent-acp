@@ -92,6 +92,8 @@ Everything from the upstream adapter, plus improvements that bring the Zed exper
 - **Read-before-edit cache** — Files are cached on Read for accurate string replacement and staleness detection during edits
 - **Subagent compatibility** — Built-in tools work everywhere, fixing silent failures from the previous MCP-based implementation
 - **No tool redirection** — Claude uses its built-in Edit/Write tools naturally; the PostToolUse hook handles interception transparently
+- **ExitPlanMode bypass option** — When exiting plan mode, users can choose "Yes, and bypass permissions" alongside the existing accept-edits and default options
+- **Clean output feed** — User message echoes from the SDK are suppressed, keeping the Zed agent output free of duplicated input
 
 All other upstream features work unchanged:
 - Context @-mentions and images
@@ -116,7 +118,7 @@ This fork is designed for easy merges. All changes are additive:
 
 | File | Change | Merge notes |
 |------|--------|-------------|
-| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications` | Keep blocks in same logical positions |
+| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, user message suppression in `prompt()`, `bypassPermissions` option in `canUseTool()` | Keep blocks in same logical positions |
 | `src/tools.ts` | Imports, helpers, `FileEditInterceptor` interface + factory at EOF, `onFileRead` option in `createPostToolUseHook` | Additions at end of file; shouldn't conflict |
 | `src/lib.ts` | 1 export line | Re-add if upstream changes exports |
 | `package.json` | `diff` dep | Keep this dependency |
