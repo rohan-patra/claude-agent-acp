@@ -652,11 +652,6 @@ export class ClaudeAcpAgent implements Agent {
               this.logger.error(message.message.content);
               break;
             }
-            // Skip user messages — they are echoed back by the SDK but should not appear in the agent output feed
-            if (message.type === "user") {
-              break;
-            }
-
             if (
               message.type === "assistant" &&
               message.message.model === "<synthetic>" &&
@@ -668,10 +663,23 @@ export class ClaudeAcpAgent implements Agent {
               throw RequestError.authRequired();
             }
 
-            // Text and thinking blocks are handled by stream events above
-            const content = message.message.content.filter(
+            // String content is a plain text echo — skip
+            if (typeof message.message.content === "string") {
+              break;
+            }
+
+            // Filter text and thinking blocks from all messages:
+            // - Assistant text/thinking are already handled by stream events above
+            // - User text blocks are SDK echoes that shouldn't appear in the output feed
+            // Keep tool_result, tool_use, and other non-text blocks (e.g. terminal output)
+            const content = (message.message.content as any[]).filter(
               (item) => !["text", "thinking"].includes(item.type),
             );
+
+            // Nothing left after filtering — skip (pure text user echo, etc.)
+            if (content.length === 0) {
+              break;
+            }
 
             for (const notification of toAcpNotifications(
               content,
