@@ -62,7 +62,8 @@ type ToolResultContent =
   | BetaTextEditorCodeExecutionStrReplaceResultBlock
   | BetaTextEditorCodeExecutionToolResultError;
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import { Logger, CLAUDE_CONFIG_DIR } from "./acp-agent.js";
+import type { Logger } from "./acp-agent.js";
+import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
 import {
   AgentInput,
   BashInput,
@@ -77,7 +78,6 @@ import {
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as diff from "diff";
 
 interface ToolInfo {
   title: string;
@@ -842,28 +842,14 @@ function applyEditContent(
 }
 
 /**
- * Apply a string replacement edit and return the new content plus a unified diff.
- */
-function applyEdit(
-  fileContent: string,
-  filePath: string,
-  oldString: string,
-  newString: string,
-  replaceAll?: boolean,
-): { newContent: string; patch: string } {
-  const newContent = applyEditContent(fileContent, oldString, newString, replaceAll);
-  const patch = diff.createPatch(filePath, fileContent, newContent);
-  return { newContent, patch };
-}
-
-/**
  * Extracts the file content string from the Read tool's tool_response in PostToolUse.
  */
 function extractReadContent(toolResponse: unknown): string | null {
   if (typeof toolResponse === "string") return toolResponse;
   if (toolResponse && typeof toolResponse === "object") {
-    if ("content" in toolResponse && typeof (toolResponse as any).content === "string") {
-      return (toolResponse as any).content;
+    const obj = toolResponse as Record<string, unknown>;
+    if ("content" in toolResponse && typeof obj.content === "string") {
+      return obj.content;
     }
   }
   return null;

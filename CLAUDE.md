@@ -151,6 +151,18 @@ Zed <──ACP (ndjson/stdio)──> ClaudeAcpAgent <──Claude Agent SDK─�
 3. No original content to revert to → revert is skipped
 4. New content is routed through ACP as usual
 
+## Creating a Release
+
+GitHub Actions is not enabled on this fork, so releases are created manually via `gh`:
+
+```bash
+git tag v<version>
+git push origin v<version>
+gh release create v<version> --title "v<version>" --generate-notes
+```
+
+Use the `-custom` suffix to distinguish from upstream versions (e.g., `v0.19.2-custom`).
+
 ## Testing
 
 ```bash

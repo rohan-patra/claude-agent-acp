@@ -672,7 +672,7 @@ export class ClaudeAcpAgent implements Agent {
             // - Assistant text/thinking are already handled by stream events above
             // - User text blocks are SDK echoes that shouldn't appear in the output feed
             // Keep tool_result, tool_use, and other non-text blocks (e.g. terminal output)
-            const content = (message.message.content as any[]).filter(
+            const content = (message.message.content as BetaContentBlock[]).filter(
               (item) => !["text", "thinking"].includes(item.type),
             );
 
