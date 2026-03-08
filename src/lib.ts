@@ -17,6 +17,7 @@ export {
 } from "./utils.js";
 export {
   toolInfoFromToolUse,
+  toDisplayPath,
   planEntries,
   toolUpdateFromToolResult,
   createFileEditInterceptor,
