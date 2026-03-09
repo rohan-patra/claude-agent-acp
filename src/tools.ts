@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   ContentBlock,
   PlanEntry,
@@ -74,9 +75,8 @@ import {
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
-} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+} from "@anthropic-ai/claude-code/sdk-tools.js";
 import * as fs from "node:fs";
-import * as path from "node:path";
 
 interface ToolInfo {
   title: string;

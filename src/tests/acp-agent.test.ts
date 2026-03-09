@@ -24,7 +24,7 @@ import {
   toolUpdateFromToolResult,
   toolUpdateFromEditToolResponse,
 } from "../tools.js";
-import { toAcpNotifications, promptToClaude, ClaudeAcpAgent } from "../acp-agent.js";
+import { toAcpNotifications, promptToClaude, ClaudeAcpAgent, claudeCliPath } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
@@ -228,7 +228,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toBe("Error: No messages to compact");
+    expect(client.takeReceivedText()).toBe("Compacting...\n\nCompacting completed.");
 
     // Send something
     await connection.prompt({
@@ -249,7 +249,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toContain("");
+    expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
   }, 30000);
 });
 
@@ -1171,6 +1171,11 @@ describe("prompt conversion", () => {
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
+  it("finds vendored cli path", async () => {
+    const path = await claudeCliPath();
+    expect(path).toContain("@anthropic-ai/claude-agent-sdk/cli.js");
+  });
+
   it("query has a 'default' model", async () => {
     const q = query({ prompt: "hi" });
     const models = await q.supportedModels();
