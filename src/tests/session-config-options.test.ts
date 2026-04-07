@@ -232,6 +232,37 @@ describe("session config options", () => {
       expect(configUpdate).toBeUndefined();
     });
 
+    it("normalizes effort_level when switching to a model with different supported levels", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium"],
+        },
+      ];
+      session.effortLevel = "high";
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-5",
+      });
+
+      expect(session.effortLevel).toBe("low");
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "low" });
+      expect(response.configOptions.find((o) => o.id === "effort_level")?.currentValue).toBe("low");
+    });
+
     it("keeps using effort_level as the public config id", async () => {
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
       session.modelInfos = [
@@ -268,6 +299,31 @@ describe("session config options", () => {
       expect(response.configOptions.find((o) => o.id === "effort_level")?.currentValue).toBe(
         "medium",
       );
+    });
+
+    it("rejects cooldown as a user-selectable fast_mode value", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.configOptions.push({
+        id: "fast_mode",
+        name: "Fast Mode",
+        type: "select",
+        category: "model",
+        description: "Faster output with the same model",
+        currentValue: "cooldown",
+        options: [
+          { value: "off", name: "Off" },
+          { value: "fast", name: "Fast" },
+          { value: "cooldown", name: "Cooling Down" },
+        ],
+      });
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "fast_mode",
+          value: "cooldown",
+        }),
+      ).rejects.toThrow("Invalid value for config option fast_mode: cooldown");
     });
 
     it("resolves model alias 'opus' to full model ID", async () => {
@@ -429,6 +485,46 @@ describe("session config options", () => {
       ).sessions[SESSION_ID];
       const modelOption = session.configOptions.find((o) => o.id === "model");
       expect(modelOption?.currentValue).toBe("claude-sonnet-4-5");
+    });
+
+    it("rebuilds capability-driven options when model support changes", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: false,
+        },
+      ];
+      session.configOptions.push({
+        id: "effort_level",
+        name: "Effort",
+        type: "select",
+        category: "thought_level",
+        description: "How much the model thinks before responding",
+        currentValue: "high",
+        options: [
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+        ],
+      });
+
+      await agent.unstable_setSessionModel({
+        sessionId: SESSION_ID,
+        modelId: "claude-sonnet-4-5",
+      });
+
+      expect(session.configOptions.find((o: any) => o.id === "effort_level")).toBeUndefined();
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: undefined });
     });
   });
 

@@ -653,10 +653,12 @@ export class ClaudeAcpAgent implements Agent {
               const newState = message.fast_mode_state;
               if (session.fastModeState !== newState) {
                 session.fastModeState = newState;
-                session.configOptions = session.configOptions.map((o) =>
-                  o.id === "fast_mode" && o.type === "select"
-                    ? { ...o, currentValue: newState === "on" ? "fast" : "off" }
-                    : o,
+                session.configOptions = buildConfigOptions(
+                  session.modes,
+                  session.models,
+                  session.modelInfos,
+                  session.effortLevel,
+                  session.fastModeState,
                 );
                 await this.client.sessionUpdate({
                   sessionId: params.sessionId,
@@ -1010,6 +1012,9 @@ export class ClaudeAcpAgent implements Agent {
     // Use the canonical option value so downstream code always receives the
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
+    if (params.configId === "fast_mode" && resolvedValue === "cooldown") {
+      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
+    }
 
     if (params.configId === "mode") {
       await this.applySessionMode(params.sessionId, resolvedValue);
@@ -1022,13 +1027,9 @@ export class ClaudeAcpAgent implements Agent {
       });
     } else if (params.configId === "model") {
       await session.query.setModel(resolvedValue);
-      session.configOptions = buildConfigOptions(
-        session.modes,
-        { ...session.models, currentModelId: resolvedValue },
-        session.modelInfos,
-        session.effortLevel,
-        session.fastModeState,
-      );
+      this.syncSessionConfigState(session, params.configId, resolvedValue);
+      await this.rebuildModelConfigOptions(session);
+      return { configOptions: session.configOptions };
     } else if (params.configId === "fast_mode") {
       const fastMode = resolvedValue === "fast";
       await session.query.applyFlagSettings({ fastMode });
@@ -1278,9 +1279,13 @@ export class ClaudeAcpAgent implements Agent {
 
     this.syncSessionConfigState(session, configId, value);
 
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
-    );
+    if (configId === "model") {
+      await this.rebuildModelConfigOptions(session);
+    } else {
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
+    }
 
     await this.client.sessionUpdate({
       sessionId,
@@ -1301,6 +1306,32 @@ export class ClaudeAcpAgent implements Agent {
     } else if (configId === "effort_level") {
       session.effortLevel = value as "low" | "medium" | "high";
     }
+  }
+
+  private async rebuildModelConfigOptions(session: Session): Promise<void> {
+    session.configOptions = buildConfigOptions(
+      session.modes,
+      session.models,
+      session.modelInfos,
+      session.effortLevel,
+      session.fastModeState,
+    );
+
+    const effortOption = session.configOptions.find(
+      (o) => o.id === "effort_level" && typeof o.currentValue === "string",
+    );
+    if (effortOption?.currentValue) {
+      const normalizedEffort = effortOption.currentValue as "low" | "medium" | "high";
+      if (session.effortLevel !== normalizedEffort) {
+        session.effortLevel = normalizedEffort;
+        await session.query.applyFlagSettings({
+          effortLevel: normalizedEffort as Settings["effortLevel"],
+        });
+      }
+      return;
+    }
+
+    await session.query.applyFlagSettings({ effortLevel: undefined });
   }
 
   private async getOrCreateSession(params: {
@@ -1700,13 +1731,15 @@ function buildConfigOptions(
   // Effort level
   if (currentModelInfo?.supportsEffort && currentModelInfo.supportedEffortLevels?.length) {
     const levels = currentModelInfo.supportedEffortLevels;
+    const normalizedEffort =
+      currentEffortLevel && levels.includes(currentEffortLevel) ? currentEffortLevel : levels[0];
     options.push({
       id: "effort_level",
       name: "Effort",
       type: "select",
       category: "thought_level",
       description: "How much the model thinks before responding",
-      currentValue: currentEffortLevel ?? "high",
+      currentValue: normalizedEffort,
       options: levels.map((level) => ({
         value: level,
         name: level.charAt(0).toUpperCase() + level.slice(1),
@@ -1722,15 +1755,34 @@ function buildConfigOptions(
       type: "select",
       category: "model",
       description: "Faster output with the same model",
-      currentValue: fastModeState === "on" ? "fast" : "off",
+      currentValue: fastModeStateToConfigValue(fastModeState),
       options: [
         { value: "off", name: "Off" },
         { value: "fast", name: "Fast" },
+        ...(fastModeState === "cooldown"
+          ? [
+              {
+                value: "cooldown",
+                name: "Cooling Down",
+                description: "Fast mode is temporarily unavailable after rate limiting",
+              },
+            ]
+          : []),
       ],
     });
   }
 
   return options;
+}
+
+function fastModeStateToConfigValue(fastModeState: "off" | "cooldown" | "on"): string {
+  if (fastModeState === "on") {
+    return "fast";
+  }
+  if (fastModeState === "cooldown") {
+    return "cooldown";
+  }
+  return "off";
 }
 
 // Claude Code CLI persists display strings like "opus[1m]" in settings,
