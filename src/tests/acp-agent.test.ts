@@ -1348,6 +1348,9 @@ describe("stop reason propagation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
   }
 
@@ -1487,6 +1490,9 @@ describe("stop reason propagation", () => {
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
 
     const response = await agent.prompt({
@@ -1560,6 +1566,9 @@ describe("session/close", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
     return agent.sessions[sessionId]!;
   }
@@ -1730,6 +1739,9 @@ describe("usage_update computation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
   }
 

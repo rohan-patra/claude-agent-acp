@@ -56,6 +56,7 @@ import {
   SDKPartialAssistantMessage,
   SDKResultMessage,
   SDKUserMessage,
+  Settings,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
@@ -126,6 +127,9 @@ type Session = {
   nextPendingOrder: number;
   fileEditInterceptor?: FileEditInterceptor;
   abortController: AbortController;
+  fastModeState: "off" | "cooldown" | "on";
+  effortLevel: "low" | "medium" | "high";
+  modelInfos: ModelInfo[];
 };
 
 type BackgroundTerminal =
@@ -236,7 +240,9 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
-const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
+type ExtendedPermissionMode = PermissionMode | "auto";
+
+const PERMISSION_MODE_ALIASES: Record<string, ExtendedPermissionMode> = {
   auto: "auto",
   default: "default",
   acceptedits: "acceptEdits",
@@ -246,7 +252,7 @@ const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   bypass: "bypassPermissions",
 };
 
-export function resolvePermissionMode(defaultMode?: unknown): PermissionMode {
+export function resolvePermissionMode(defaultMode?: unknown): ExtendedPermissionMode {
   if (defaultMode === undefined) {
     return "default";
   }
@@ -642,6 +648,26 @@ export class ClaudeAcpAgent implements Agent {
               });
             }
 
+            // Sync fast mode state from SDK result
+            if ("fast_mode_state" in message && message.fast_mode_state) {
+              const newState = message.fast_mode_state;
+              if (session.fastModeState !== newState) {
+                session.fastModeState = newState;
+                session.configOptions = session.configOptions.map((o) =>
+                  o.id === "fast_mode" && o.type === "select"
+                    ? { ...o, currentValue: newState === "on" ? "fast" : "off" }
+                    : o,
+                );
+                await this.client.sessionUpdate({
+                  sessionId: params.sessionId,
+                  update: {
+                    sessionUpdate: "config_option_update",
+                    configOptions: session.configOptions,
+                  },
+                });
+              }
+            }
+
             if (session.cancelled) {
               stopReason = "cancelled";
               break;
@@ -995,10 +1021,26 @@ export class ClaudeAcpAgent implements Agent {
         },
       });
     } else if (params.configId === "model") {
-      await this.sessions[params.sessionId].query.setModel(resolvedValue);
+      await session.query.setModel(resolvedValue);
+      session.configOptions = buildConfigOptions(
+        session.modes,
+        { ...session.models, currentModelId: resolvedValue },
+        session.modelInfos,
+        session.effortLevel,
+        session.fastModeState,
+      );
+    } else if (params.configId === "fast_mode") {
+      const fastMode = resolvedValue === "fast";
+      await session.query.applyFlagSettings({ fastMode });
+      session.fastModeState = fastMode ? "on" : "off";
+    } else if (params.configId === "effort_level") {
+      await session.query.applyFlagSettings({
+        effortLevel: resolvedValue as Settings["effortLevel"],
+      });
+      session.effortLevel = resolvedValue as "low" | "medium" | "high";
     }
 
-    this.syncSessionConfigState(session, params.configId, params.value);
+    this.syncSessionConfigState(session, params.configId, resolvedValue);
 
     session.configOptions = session.configOptions.map((o) =>
       o.id === params.configId && typeof o.currentValue === "string"
@@ -1022,7 +1064,7 @@ export class ClaudeAcpAgent implements Agent {
         throw new Error("Invalid Mode");
     }
     try {
-      await this.sessions[sessionId].query.setPermissionMode(modeId);
+      await this.sessions[sessionId].query.setPermissionMode(modeId as PermissionMode);
     } catch (error) {
       if (error instanceof Error) {
         if (!error.message) {
@@ -1254,6 +1296,10 @@ export class ClaudeAcpAgent implements Agent {
       session.modes = { ...session.modes, currentModeId: value };
     } else if (configId === "model") {
       session.models = { ...session.models, currentModelId: value };
+    } else if (configId === "fast_mode") {
+      session.fastModeState = value === "fast" ? "on" : "off";
+    } else if (configId === "effort_level") {
+      session.effortLevel = value as "low" | "medium" | "high";
     }
   }
 
@@ -1404,7 +1450,7 @@ export class ClaudeAcpAgent implements Agent {
       // If we want bypassPermissions to be an option, we have to allow it here.
       // But it doesn't work in root mode, so we only activate it if it will work.
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
-      permissionMode,
+      permissionMode: permissionMode as PermissionMode,
       canUseTool: this.canUseTool(sessionId),
       // note: although not documented by the types, passing an absolute path
       // here works to find zed's managed node version.
@@ -1495,7 +1541,11 @@ export class ClaudeAcpAgent implements Agent {
       );
     }
 
-    const models = await getAvailableModels(q, initializationResult.models, settingsManager);
+    const { models, modelInfos } = await getAvailableModels(
+      q,
+      initializationResult.models,
+      settingsManager,
+    );
 
     const availableModes = [
       {
@@ -1538,7 +1588,15 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
-    const configOptions = buildConfigOptions(modes, models);
+    const initialFastModeState = initializationResult.fast_mode_state ?? "off";
+
+    const configOptions = buildConfigOptions(
+      modes,
+      models,
+      modelInfos,
+      "high",
+      initialFastModeState,
+    );
 
     this.sessions[sessionId] = {
       query: q,
@@ -1560,6 +1618,9 @@ export class ClaudeAcpAgent implements Agent {
       nextPendingOrder: 0,
       fileEditInterceptor,
       abortController,
+      fastModeState: initialFastModeState,
+      effortLevel: "high",
+      modelInfos,
     };
 
     return {
@@ -1601,8 +1662,11 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
+  modelInfos: ModelInfo[],
+  currentEffortLevel?: string,
+  fastModeState?: "off" | "cooldown" | "on",
 ): SessionConfigOption[] {
-  return [
+  const options: SessionConfigOption[] = [
     {
       id: "mode",
       name: "Mode",
@@ -1630,6 +1694,43 @@ function buildConfigOptions(
       })),
     },
   ];
+
+  const currentModelInfo = modelInfos.find((m) => m.value === models.currentModelId);
+
+  // Effort level
+  if (currentModelInfo?.supportsEffort && currentModelInfo.supportedEffortLevels?.length) {
+    const levels = currentModelInfo.supportedEffortLevels;
+    options.push({
+      id: "effort_level",
+      name: "Effort",
+      type: "select",
+      category: "thought_level",
+      description: "How much the model thinks before responding",
+      currentValue: currentEffortLevel ?? "high",
+      options: levels.map((level) => ({
+        value: level,
+        name: level.charAt(0).toUpperCase() + level.slice(1),
+      })),
+    });
+  }
+
+  // Fast mode
+  if (currentModelInfo?.supportsFastMode && fastModeState) {
+    options.push({
+      id: "fast_mode",
+      name: "Fast Mode",
+      type: "select",
+      category: "model",
+      description: "Faster output with the same model",
+      currentValue: fastModeState === "on" ? "fast" : "off",
+      options: [
+        { value: "off", name: "Off" },
+        { value: "fast", name: "Fast" },
+      ],
+    });
+  }
+
+  return options;
 }
 
 // Claude Code CLI persists display strings like "opus[1m]" in settings,
@@ -1709,7 +1810,7 @@ async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   settingsManager: SettingsManager,
-): Promise<SessionModelState> {
+): Promise<{ models: SessionModelState; modelInfos: ModelInfo[] }> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -1724,12 +1825,15 @@ async function getAvailableModels(
   await query.setModel(currentModel.value);
 
   return {
-    availableModels: models.map((model) => ({
-      modelId: model.value,
-      name: model.displayName,
-      description: model.description,
-    })),
-    currentModelId: currentModel.value,
+    models: {
+      availableModels: models.map((model) => ({
+        modelId: model.value,
+        name: model.displayName.replace("Default (recommended)", "Opus"),
+        description: model.description,
+      })),
+      currentModelId: currentModel.value,
+    },
+    modelInfos: models,
   };
 }
 
