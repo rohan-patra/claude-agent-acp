@@ -1732,7 +1732,9 @@ function buildConfigOptions(
   if (currentModelInfo?.supportsEffort && currentModelInfo.supportedEffortLevels?.length) {
     const levels = currentModelInfo.supportedEffortLevels;
     const normalizedEffort =
-      currentEffortLevel && levels.includes(currentEffortLevel) ? currentEffortLevel : levels[0];
+      currentEffortLevel && levels.some((level) => level === currentEffortLevel)
+        ? currentEffortLevel
+        : levels[0];
     options.push({
       id: "effort_level",
       name: "Effort",
