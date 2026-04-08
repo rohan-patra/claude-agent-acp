@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.26.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.25.3...v0.26.0) (2026-04-08)
+
+
+### Features
+
+* Update claude-agent-sdk to 0.2.96 ([#526](https://github.com/agentclientprotocol/claude-agent-acp/issues/526)) ([c073131](https://github.com/agentclientprotocol/claude-agent-acp/commit/c07313148808a55f27f385c10babbaf7511a7f12))
+
+
+### Bug Fixes
+
+* Remove bun builds from release ([#525](https://github.com/agentclientprotocol/claude-agent-acp/issues/525)) ([fcf5aaf](https://github.com/agentclientprotocol/claude-agent-acp/commit/fcf5aaf06dfe9f7d1b285b976eeb2d1e20ea8dec))
+* Use TUI login for remote environments ([#523](https://github.com/agentclientprotocol/claude-agent-acp/issues/523)) ([cc73e37](https://github.com/agentclientprotocol/claude-agent-acp/commit/cc73e37b41678aa67813c4fbef66ba33ca538743))
+
+## [0.25.3](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.25.2...v0.25.3) (2026-04-06)
+
+
+### Bug Fixes
+
+* Drop claude-agent-sdk back to 0.2.91 to fix broken import ([#513](https://github.com/agentclientprotocol/claude-agent-acp/issues/513)) ([26f3e8a](https://github.com/agentclientprotocol/claude-agent-acp/commit/26f3e8a5216295985fadb80fb3b977045c0c1b2c))
+* Recreate resumed sessions when params change ([#515](https://github.com/agentclientprotocol/claude-agent-acp/issues/515)) ([aa82193](https://github.com/agentclientprotocol/claude-agent-acp/commit/aa82193330026bae132fed8391c47dde777dcf5a))
+
+## [0.25.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.25.1...v0.25.2) (2026-04-06)
+
+
+### Bug Fixes
+
+* prioritize ANTHROPIC_MODEL env var over settings.model in model … ([#505](https://github.com/agentclientprotocol/claude-agent-acp/issues/505)) ([bea1a40](https://github.com/agentclientprotocol/claude-agent-acp/commit/bea1a40e9bfe1e06672b118a727f9339def3be23))
+
 ## [0.25.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.25.0...v0.25.1) (2026-04-06)
 
 

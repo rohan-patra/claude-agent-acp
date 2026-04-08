@@ -116,6 +116,9 @@ type Session = {
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   cwd: string;
+  /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
+   *  detect when loadSession/resumeSession is called with changed values. */
+  sessionFingerprint: string;
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
@@ -127,6 +130,18 @@ type Session = {
   fileEditInterceptor?: FileEditInterceptor;
   abortController: AbortController;
 };
+
+/** Compute a stable fingerprint of the session-defining params so we can
+ *  detect when a loadSession/resumeSession call requires tearing down and
+ *  recreating the underlying Query process.  MCP servers are sorted by name
+ *  so that ordering differences don't trigger unnecessary recreations. */
+function computeSessionFingerprint(params: {
+  cwd: string;
+  mcpServers?: NewSessionRequest["mcpServers"];
+}): string {
+  const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
+  return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
+}
 
 type BackgroundTerminal =
   | {
@@ -313,40 +328,75 @@ export class ClaudeAcpAgent implements Agent {
 
     const supportsTerminalAuth = request.clientCapabilities?.auth?.terminal === true;
     const supportsMetaTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
+    const noBrowser = !!process.env.NO_BROWSER;
 
-    const claudeLoginMethod: any = {
-      description: "Use Claude subscription ",
-      name: "Claude Subscription",
-      id: "claude-ai-login",
-      type: "terminal",
-      args: ["--cli", "auth", "login", "--claudeai"],
-    };
+    // When NO_BROWSER is set (e.g. remote environments), fall back to the single
+    // terminal-only login that doesn't try to open a browser.
+    const terminalAuthMethods: AuthMethod[] = [];
 
-    const consoleLoginMethod: any = {
-      description: "Use Anthropic Console (API usage billing)",
-      name: "Anthropic Console",
-      id: "console-login",
-      type: "terminal",
-      args: ["--cli", "auth", "login", "--console"],
-    };
-
-    // If client supports terminal-auth capability, use that instead.
-    if (supportsMetaTerminalAuth) {
-      const baseArgs = process.argv.slice(1);
-      claudeLoginMethod._meta = {
-        "terminal-auth": {
-          command: process.execPath,
-          args: [...baseArgs, "--cli", "auth", "login", "--claudeai"],
-          label: "Claude Login",
-        },
+    if (noBrowser) {
+      const remoteLoginMethod: AuthMethod = {
+        description: "Run `claude /login` in the terminal",
+        name: "Log in with Claude",
+        id: "claude-login",
+        type: "terminal",
+        args: ["--cli"],
       };
-      consoleLoginMethod._meta = {
-        "terminal-auth": {
-          command: process.execPath,
-          args: [...baseArgs, "--cli", "auth", "login", "--console"],
-          label: "Anthropic Console Login",
-        },
+
+      if (supportsMetaTerminalAuth) {
+        remoteLoginMethod._meta = {
+          "terminal-auth": {
+            command: process.execPath,
+            args: [...process.argv.slice(1), "--cli"],
+            label: "Claude Login",
+          },
+        };
+      }
+
+      if (!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)) {
+        terminalAuthMethods.push(remoteLoginMethod);
+      }
+    } else {
+      const claudeLoginMethod: AuthMethod = {
+        description: "Use Claude subscription ",
+        name: "Claude Subscription",
+        id: "claude-ai-login",
+        type: "terminal",
+        args: ["--cli", "auth", "login", "--claudeai"],
       };
+
+      const consoleLoginMethod: AuthMethod = {
+        description: "Use Anthropic Console (API usage billing)",
+        name: "Anthropic Console",
+        id: "console-login",
+        type: "terminal",
+        args: ["--cli", "auth", "login", "--console"],
+      };
+
+      if (supportsMetaTerminalAuth) {
+        const baseArgs = process.argv.slice(1);
+        claudeLoginMethod._meta = {
+          "terminal-auth": {
+            command: process.execPath,
+            args: [...baseArgs, "--cli", "auth", "login", "--claudeai"],
+            label: "Claude Login",
+          },
+        };
+        consoleLoginMethod._meta = {
+          "terminal-auth": {
+            command: process.execPath,
+            args: [...baseArgs, "--cli", "auth", "login", "--console"],
+            label: "Anthropic Console Login",
+          },
+        };
+      }
+
+      if (!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)) {
+        terminalAuthMethods.push(claudeLoginMethod);
+      }
+      if (supportsTerminalAuth || supportsMetaTerminalAuth) {
+        terminalAuthMethods.push(consoleLoginMethod);
+      }
     }
 
     return {
@@ -378,13 +428,7 @@ export class ClaudeAcpAgent implements Agent {
         title: "Claude Agent",
         version: packageJson.version,
       },
-      authMethods: [
-        ...(!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)
-          ? [claudeLoginMethod]
-          : []),
-        ...(supportsTerminalAuth || supportsMetaTerminalAuth ? [consoleLoginMethod] : []),
-        ...(supportsGatewayAuth ? [gatewayAuthMethod] : []),
-      ],
+      authMethods: [...terminalAuthMethods, ...(supportsGatewayAuth ? [gatewayAuthMethod] : [])],
     };
   }
 
@@ -906,17 +950,24 @@ export class ClaudeAcpAgent implements Agent {
     await session.query.interrupt();
   }
 
-  async unstable_closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    const session = this.sessions[params.sessionId];
+  /** Cleanly tear down a session: cancel in-flight work, dispose resources,
+   *  and remove it from the session map. */
+  private async teardownSession(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
     if (!session) {
-      throw new Error("Session not found");
+      return;
     }
-    await this.cancel({ sessionId: params.sessionId });
-
+    await this.cancel({ sessionId });
     session.settingsManager.dispose();
     session.abortController.abort();
-    delete this.sessions[params.sessionId];
+    delete this.sessions[sessionId];
+  }
 
+  async unstable_closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    if (!this.sessions[params.sessionId]) {
+      throw new Error("Session not found");
+    }
+    await this.teardownSession(params.sessionId);
     return {};
   }
 
@@ -1084,6 +1135,7 @@ export class ClaudeAcpAgent implements Agent {
 
       if (toolName === "ExitPlanMode") {
         const options = [
+          { kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
           {
             kind: "allow_always",
             name: "Yes, and auto-accept edits",
@@ -1121,6 +1173,7 @@ export class ClaudeAcpAgent implements Agent {
           response.outcome?.outcome === "selected" &&
           (response.outcome.optionId === "default" ||
             response.outcome.optionId === "acceptEdits" ||
+            response.outcome.optionId === "auto" ||
             response.outcome.optionId === "bypassPermissions")
         ) {
           await this.client.sessionUpdate({
@@ -1265,12 +1318,20 @@ export class ClaudeAcpAgent implements Agent {
   }): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
-      return {
-        sessionId: params.sessionId,
-        modes: existingSession.modes,
-        models: existingSession.models,
-        configOptions: existingSession.configOptions,
-      };
+      const fingerprint = computeSessionFingerprint(params);
+      if (fingerprint === existingSession.sessionFingerprint) {
+        return {
+          sessionId: params.sessionId,
+          modes: existingSession.modes,
+          models: existingSession.models,
+          configOptions: existingSession.configOptions,
+        };
+      }
+
+      // Session-defining params changed (e.g. cwd pointed at a git worktree,
+      // or MCP servers reconfigured). Tear down the existing session and
+      // recreate it so the underlying Query process picks up the new values.
+      await this.teardownSession(params.sessionId);
     }
 
     const response = await this.createSession(
@@ -1501,7 +1562,7 @@ export class ClaudeAcpAgent implements Agent {
       {
         id: "auto",
         name: "Auto",
-        decription: "Use a model classifier to approve/deny permission prompts.",
+        description: "Use a model classifier to approve/deny permission prompts.",
       },
       {
         id: "default",
@@ -1545,6 +1606,7 @@ export class ClaudeAcpAgent implements Agent {
       input: input,
       cancelled: false,
       cwd: params.cwd,
+      sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1714,7 +1776,16 @@ async function getAvailableModels(
 
   let currentModel = models[0];
 
-  if (settings.model) {
+  // Model priority (highest to lowest):
+  // 1. ANTHROPIC_MODEL environment variable
+  // 2. settings.model (user configuration)
+  // 3. models[0] (default first model)
+  if (process.env.ANTHROPIC_MODEL) {
+    const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
+    if (match) {
+      currentModel = match;
+    }
+  } else if (settings.model) {
     const match = resolveModelPreference(models, settings.model);
     if (match) {
       currentModel = match;
