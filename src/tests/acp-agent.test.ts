@@ -1350,6 +1350,9 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
   }
 
@@ -1491,6 +1494,9 @@ describe("stop reason propagation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
 
     const response = await agent.prompt({
@@ -1566,6 +1572,9 @@ describe("session/close", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
     return agent.sessions[sessionId]!;
   }
@@ -1660,6 +1669,9 @@ describe("getOrCreateSession param change detection", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
     return agent.sessions[sessionId]!;
   }
@@ -1875,6 +1887,9 @@ describe("usage_update computation", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
   }
 
@@ -2255,6 +2270,9 @@ describe("emitRawSDKMessages", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages,
+      fastModeState: "off",
+      effortLevel: "high",
+      modelInfos: [],
     };
   }
 

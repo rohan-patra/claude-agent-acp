@@ -67,6 +67,7 @@ describe("session config options", () => {
   let createSessionSpy: ReturnType<typeof vi.fn>;
   let setPermissionModeSpy: ReturnType<typeof vi.fn>;
   let setModelSpy: ReturnType<typeof vi.fn>;
+  let applyFlagSettingsSpy: ReturnType<typeof vi.fn>;
 
   function createMockClient(): AgentSideConnection {
     return {
@@ -82,18 +83,25 @@ describe("session config options", () => {
   function populateSession() {
     setPermissionModeSpy = vi.fn();
     setModelSpy = vi.fn();
+    applyFlagSettingsSpy = vi.fn();
 
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
       query: {
         setPermissionMode: setPermissionModeSpy,
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        applyFlagSettings: applyFlagSettingsSpy,
       },
       input: null,
       cancelled: false,
       permissionMode: "default",
       settingsManager: {},
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
+      modes: structuredClone(MOCK_MODES),
+      models: structuredClone(MOCK_MODELS),
+      modelInfos: [],
+      fastModeState: "off",
+      effortLevel: "high",
     };
   }
 
@@ -222,6 +230,78 @@ describe("session config options", () => {
         (n) => n.update.sessionUpdate === "config_option_update",
       );
       expect(configUpdate).toBeUndefined();
+    });
+
+    it("changes effort_level and calls applyFlagSettings", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+        },
+      ];
+      session.configOptions.push({
+        id: "effort_level",
+        name: "Effort",
+        type: "select",
+        category: "thought_level",
+        description: "How much the model thinks before responding",
+        currentValue: "high",
+        options: [
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+        ],
+      });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort_level",
+        value: "medium",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "medium" });
+      expect(session.effortLevel).toBe("medium");
+      expect(response.configOptions.find((o) => o.id === "effort_level")?.currentValue).toBe(
+        "medium",
+      );
+    });
+
+    it("changes fast_mode and calls applyFlagSettings", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsFastMode: true,
+        },
+      ];
+      session.configOptions.push({
+        id: "fast_mode",
+        name: "Fast Mode",
+        type: "select",
+        category: "model",
+        description: "Faster output with the same model",
+        currentValue: "off",
+        options: [
+          { value: "off", name: "Off" },
+          { value: "fast", name: "Fast" },
+        ],
+      });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "fast_mode",
+        value: "fast",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ fastMode: true });
+      expect(session.fastModeState).toBe("on");
+      expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("fast");
     });
 
     it("resolves model alias 'opus' to full model ID", async () => {

@@ -77,6 +77,25 @@ Added exports:
 export { ..., createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
 ```
 
+### Session Config Improvements
+
+In addition to the FileEditInterceptor, this fork adds model-aware session config options:
+
+1. **`effort_level` selector** — When the current model supports effort levels (`ModelInfo.supportsEffort`), a "thought_level" category select appears in the session config. Uses `query.applyFlagSettings({ effortLevel })` to apply changes.
+
+2. **`fast_mode` toggle** — When the current model supports fast mode (`ModelInfo.supportsFastMode`), a "model" category select appears with Off/Fast options. Uses `query.applyFlagSettings({ fastMode })`. The SDK's `fast_mode_state` from result messages is synced back to the session so the UI reflects server-side transitions (e.g., cooldown).
+
+3. **Model capability tracking** — `Session` stores `modelInfos: ModelInfo[]` (the raw SDK model list). When the user switches models via `setSessionConfigOption("model", ...)`, `buildConfigOptions()` is called to rebuild the config options, showing or hiding effort/fast options based on the new model's capabilities.
+
+**Modified areas in `src/acp-agent.ts`:**
+- `Session` type: added `fastModeState`, `effortLevel`, `modelInfos` fields
+- `buildConfigOptions()`: accepts optional `modelInfos`, `currentEffortLevel`, `fastModeState` params; conditionally pushes `effort_level` and `fast_mode` options
+- `setSessionConfigOption()`: handles `fast_mode` and `effort_level` config IDs; model handler rebuilds config options
+- `syncSessionConfigState()`: handles `fast_mode` and `effort_level`
+- `prompt()` result handler: syncs `fast_mode_state` from SDK result messages
+- `getAvailableModels()`: returns `{ models, modelInfos }` instead of just `SessionModelState`
+- `createSession()`: initializes new session fields and passes them to `buildConfigOptions()`
+
 ## How to Merge Upstream Updates
 
 When pulling changes from `zed-industries/claude-agent-acp`:
@@ -85,8 +104,9 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - `createFileEditInterceptor` block (~5 lines in `createSession()` after capabilities check)
    - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
+   - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`, `getAvailableModels()` returns `{ models, modelInfos }`
 
-   If upstream modifies `createSession()`, `toAcpNotifications()`, or `streamEventToAcpNotifications()`, these blocks just need to stay in the same logical positions.
+   If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, `setSessionConfigOption()`, or `getAvailableModels()`, our blocks need to stay in the same logical positions.
 
 2. **`src/tools.ts`** — Our changes are:
    - `fs` import addition at the top
