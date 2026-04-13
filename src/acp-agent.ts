@@ -61,7 +61,6 @@ import {
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { randomUUID } from "node:crypto";
-import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
@@ -129,6 +128,7 @@ type Session = {
   nextPendingOrder: number;
   fileEditInterceptor?: FileEditInterceptor;
   abortController: AbortController;
+  emitRawSDKMessages: boolean | SDKMessageFilter[];
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -154,6 +154,11 @@ type BackgroundTerminal =
       pendingOutput: TerminalOutputResponse;
     };
 
+export type SDKMessageFilter = {
+  type: string;
+  subtype?: string;
+};
+
 /**
  * Extra metadata that can be given when creating a new session.
  */
@@ -175,6 +180,14 @@ export type NewSessionMeta = {
      *   - tools (passed through; defaults to claude_code preset if not provided)
      */
     options?: Options;
+    /**
+     * When set, raw SDK messages are emitted as extNotification("_claude/sdkMessage", message)
+     * in addition to normal processing.
+     * - true: emit all messages
+     * - false/undefined: emit nothing (default)
+     * - SDKMessageFilter[]: emit only messages matching at least one filter
+     */
+    emitRawSDKMessages?: boolean | SDKMessageFilter[];
   };
   additionalRoots?: string[];
 };
@@ -328,13 +341,21 @@ export class ClaudeAcpAgent implements Agent {
 
     const supportsTerminalAuth = request.clientCapabilities?.auth?.terminal === true;
     const supportsMetaTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
-    const noBrowser = !!process.env.NO_BROWSER;
 
-    // When NO_BROWSER is set (e.g. remote environments), fall back to the single
-    // terminal-only login that doesn't try to open a browser.
+    // Detect remote environments where the OAuth browser redirect to localhost
+    // won't work. This matches the SDK's internal isRemote check. In these cases,
+    // the `auth login` subcommand would fall back to a device-code-like manual
+    // flow, which doesn't work well over ACP, so we offer the TUI login instead.
+    const isRemote = !!(
+      process.env.NO_BROWSER ||
+      process.env.SSH_CONNECTION ||
+      process.env.SSH_CLIENT ||
+      process.env.SSH_TTY ||
+      process.env.CLAUDE_CODE_REMOTE
+    );
     const terminalAuthMethods: AuthMethod[] = [];
 
-    if (noBrowser) {
+    if (isRemote) {
       const remoteLoginMethod: AuthMethod = {
         description: "Run `claude /login` in the terminal",
         name: "Log in with Claude",
@@ -433,14 +454,6 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    if (
-      !this.gatewayAuthMeta &&
-      fs.existsSync(path.resolve(os.homedir(), ".claude.json.backup")) &&
-      !fs.existsSync(path.resolve(os.homedir(), ".claude.json"))
-    ) {
-      throw RequestError.authRequired();
-    }
-
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
@@ -578,6 +591,16 @@ export class ClaudeAcpAgent implements Agent {
           break;
         }
 
+        if (
+          session.emitRawSDKMessages &&
+          shouldEmitRawMessage(session.emitRawSDKMessages, message)
+        ) {
+          await this.client.extNotification("_claude/sdkMessage", {
+            sessionId: params.sessionId,
+            message: message as Record<string, unknown>,
+          });
+        }
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -648,6 +671,7 @@ export class ClaudeAcpAgent implements Agent {
               case "task_started":
               case "task_notification":
               case "task_progress":
+              case "task_updated":
               case "elicitation_complete":
               case "api_retry":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
@@ -940,7 +964,7 @@ export class ClaudeAcpAgent implements Agent {
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions[params.sessionId];
     if (!session) {
-      throw new Error("Session not found");
+      return;
     }
     session.cancelled = true;
     for (const [, pending] of session.pendingMessages) {
@@ -960,7 +984,13 @@ export class ClaudeAcpAgent implements Agent {
     await this.cancel({ sessionId });
     session.settingsManager.dispose();
     session.abortController.abort();
+    session.query.close();
     delete this.sessions[sessionId];
+  }
+
+  /** Tear down all active sessions. Called when the ACP connection closes. */
+  async dispose(): Promise<void> {
+    await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
   async unstable_closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -1622,6 +1652,7 @@ export class ClaudeAcpAgent implements Agent {
       nextPendingOrder: 0,
       fileEditInterceptor,
       abortController,
+      emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
     };
 
     return {
@@ -1631,6 +1662,17 @@ export class ClaudeAcpAgent implements Agent {
       configOptions,
     };
   }
+}
+
+function shouldEmitRawMessage(
+  config: boolean | SDKMessageFilter[],
+  message: { type: string; subtype?: string },
+): boolean {
+  if (config === true) return true;
+  if (config === false) return false;
+  return config.some(
+    (f) => f.type === message.type && (f.subtype === undefined || f.subtype === message.subtype),
+  );
 }
 
 function sessionUsage(session: Session) {
@@ -2018,8 +2060,8 @@ export function toAcpNotifications(
         const alreadyCached = chunk.id in toolUseCache;
         toolUseCache[chunk.id] = chunk;
         if (chunk.name === "TodoWrite") {
-          // @ts-expect-error - sometimes input is empty object
-          if (Array.isArray(chunk.input.todos)) {
+          // @ts-expect-error - sometimes input is empty object or undefined
+          if (Array.isArray(chunk.input?.todos)) {
             update = {
               sessionUpdate: "plan",
               entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
@@ -2188,6 +2230,7 @@ export function toAcpNotifications(
       case "container_upload":
       case "compaction":
       case "compaction_delta":
+      case "advisor_tool_result":
         break;
 
       default:
@@ -2273,7 +2316,12 @@ export function runAcp() {
   const output = nodeToWebReadable(process.stdin);
 
   const stream = ndJsonStream(input, output);
-  new AgentSideConnection((client) => new ClaudeAcpAgent(client), stream);
+  let agent!: ClaudeAcpAgent;
+  const connection = new AgentSideConnection((client) => {
+    agent = new ClaudeAcpAgent(client);
+    return agent;
+  }, stream);
+  return { connection, agent };
 }
 
 function commonPrefixLength(a: string, b: string) {
