@@ -874,6 +874,11 @@ export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEdi
         ) {
           return;
         }
+        // Skip .context/ files — these should apply directly without review UI.
+        const contextDir = resolvedCwd + path.sep + ".context" + path.sep;
+        if (resolvedFilePath.startsWith(contextDir)) {
+          return;
+        }
       }
 
       const originalContent = fileContentCache.get(filePath);

@@ -61,6 +61,7 @@ import {
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
@@ -1448,6 +1449,17 @@ export class ClaudeAcpAgent implements Agent {
     });
     await settingsManager.initialize();
 
+    // Ensure .context is excluded from git tracking
+    const excludePath = path.join(params.cwd, ".git", "info", "exclude");
+    try {
+      const content = fs.readFileSync(excludePath, "utf-8");
+      if (!content.split("\n").some((line) => line.trim() === ".context")) {
+        fs.appendFileSync(excludePath, `${content.endsWith("\n") ? "" : "\n"}.context\n`);
+      }
+    } catch {
+      // .git/info/exclude doesn't exist (not a git repo, or bare repo) — skip
+    }
+
     const mcpServers: Record<string, McpServerConfig> = {};
     let fileEditInterceptor: FileEditInterceptor | undefined;
     if (this.clientCapabilities?.fs?.writeTextFile) {
@@ -1521,6 +1533,7 @@ export class ClaudeAcpAgent implements Agent {
 
     const options: Options = {
       systemPrompt,
+      settings: { plansDirectory: ".context/plans" },
       settingSources: ["user", "project", "local"],
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
