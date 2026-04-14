@@ -1,4 +1,7 @@
-import { describe, it, expect } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { describe, it, expect, vi } from "vitest";
 import { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -12,6 +15,7 @@ import {
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
 import {
+  createFileEditInterceptor,
   toolUpdateFromToolResult,
   createPostToolUseHook,
   toolInfoFromToolUse,
@@ -1274,6 +1278,251 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
 
     expect(info.kind).toBe("switch_mode");
     expect(info.content).toEqual([]);
+  });
+});
+
+describe("FileEditInterceptor", () => {
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  it("treats PostToolUse responses with error: null as successful writes", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-file-edit-"));
+
+    try {
+      const filePath = path.join(tmpDir, "example.txt");
+      const interceptor = createFileEditInterceptor(mockLogger, tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+
+      interceptor.onFileRead(filePath, "before");
+      fs.writeFileSync(filePath, "after");
+
+      await interceptor.interceptEditWrite(
+        "Write",
+        {
+          file_path: filePath,
+          content: "after",
+        },
+        {
+          filePath,
+          success: true,
+          error: null,
+        },
+        writeTextFile,
+      );
+
+      expect(writeTextFile).toHaveBeenCalledTimes(1);
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "after");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("before");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("subagent Edit/Write interception", () => {
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  it("routes subagent Write PostToolUse through the file edit interceptor", async () => {
+    const toolUseCache: ToolUseCache = {};
+    const hookUpdates: any[] = [];
+    const fileEditInterceptor = {
+      onFileRead: vi.fn(),
+      interceptEditWrite: vi.fn(async () => {}),
+    };
+
+    const mockClientWithUpdate = {
+      sessionUpdate: async (notification: any) => {
+        hookUpdates.push(notification);
+      },
+      writeTextFile: vi.fn(async () => ({})),
+    } as unknown as AgentSideConnection;
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_use" as const,
+          id: "toolu_subagent_write",
+          name: "Write",
+          input: {
+            file_path: "/Users/test/project/file.ts",
+            content: "new content",
+          },
+        },
+      ],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClientWithUpdate,
+      mockLogger,
+      {
+        parentToolUseId: "toolu_parent_task",
+        fileEditInterceptor: fileEditInterceptor as any,
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect((notifications[0].update as any)._meta.claudeCode.parentToolUseId).toBe(
+      "toolu_parent_task",
+    );
+
+    const hook = createPostToolUseHook(mockLogger);
+    await hook(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Write",
+        tool_input: {
+          file_path: "/Users/test/project/file.ts",
+          content: "new content",
+        },
+        tool_response: {
+          filePath: "/Users/test/project/file.ts",
+          success: true,
+          error: null,
+        },
+        tool_use_id: "toolu_subagent_write",
+        session_id: "test-session",
+        transcript_path: "/tmp/test",
+        cwd: "/tmp",
+        agent_id: "agent-1",
+        agent_type: "general-purpose",
+      },
+      "toolu_subagent_write",
+      { signal: AbortSignal.abort() },
+    );
+
+    expect(fileEditInterceptor.interceptEditWrite).toHaveBeenCalledTimes(1);
+    expect(fileEditInterceptor.interceptEditWrite).toHaveBeenCalledWith(
+      "Write",
+      {
+        file_path: "/Users/test/project/file.ts",
+        content: "new content",
+      },
+      {
+        filePath: "/Users/test/project/file.ts",
+        success: true,
+        error: null,
+      },
+      expect.any(Function),
+    );
+    expect(hookUpdates).toHaveLength(1);
+    expect(hookUpdates[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_subagent_write",
+    });
+  });
+
+  it("routes subagent Edit PostToolUse through the file edit interceptor and preserves diff updates", async () => {
+    const toolUseCache: ToolUseCache = {};
+    const hookUpdates: any[] = [];
+    const fileEditInterceptor = {
+      onFileRead: vi.fn(),
+      interceptEditWrite: vi.fn(async () => {}),
+    };
+
+    const mockClientWithUpdate = {
+      sessionUpdate: async (notification: any) => {
+        hookUpdates.push(notification);
+      },
+      writeTextFile: vi.fn(async () => ({})),
+    } as unknown as AgentSideConnection;
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_use" as const,
+          id: "toolu_subagent_edit",
+          name: "Edit",
+          input: {
+            file_path: "/Users/test/project/file.ts",
+            old_string: "old text",
+            new_string: "new text",
+          },
+        },
+      ],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClientWithUpdate,
+      mockLogger,
+      {
+        parentToolUseId: "toolu_parent_task",
+        fileEditInterceptor: fileEditInterceptor as any,
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect((notifications[0].update as any)._meta.claudeCode.parentToolUseId).toBe(
+      "toolu_parent_task",
+    );
+
+    const hook = createPostToolUseHook(mockLogger);
+    await hook(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Edit",
+        tool_input: {
+          file_path: "/Users/test/project/file.ts",
+          old_string: "old text",
+          new_string: "new text",
+        },
+        tool_response: {
+          filePath: "/Users/test/project/file.ts",
+          structuredPatch: [
+            {
+              oldStart: 5,
+              oldLines: 1,
+              newStart: 5,
+              newLines: 1,
+              lines: ["-old text", "+new text"],
+            },
+          ],
+        },
+        tool_use_id: "toolu_subagent_edit",
+        session_id: "test-session",
+        transcript_path: "/tmp/test",
+        cwd: "/tmp",
+        agent_id: "agent-1",
+        agent_type: "general-purpose",
+      },
+      "toolu_subagent_edit",
+      { signal: AbortSignal.abort() },
+    );
+
+    expect(fileEditInterceptor.interceptEditWrite).toHaveBeenCalledTimes(1);
+    expect(fileEditInterceptor.interceptEditWrite).toHaveBeenCalledWith(
+      "Edit",
+      {
+        file_path: "/Users/test/project/file.ts",
+        old_string: "old text",
+        new_string: "new text",
+      },
+      {
+        filePath: "/Users/test/project/file.ts",
+        structuredPatch: [
+          {
+            oldStart: 5,
+            oldLines: 1,
+            newStart: 5,
+            newLines: 1,
+            lines: ["-old text", "+new text"],
+          },
+        ],
+      },
+      expect.any(Function),
+    );
+    expect(hookUpdates).toHaveLength(1);
+    expect(hookUpdates[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_subagent_edit",
+      content: [
+        {
+          type: "diff",
+          path: "/Users/test/project/file.ts",
+          oldText: "old text",
+          newText: "new text",
+        },
+      ],
+      locations: [{ path: "/Users/test/project/file.ts", line: 5 }],
+    });
   });
 });
 

@@ -93,8 +93,7 @@ In addition to the FileEditInterceptor, this fork adds model-aware session confi
 - `setSessionConfigOption()`: handles `fast_mode` and `effort_level` config IDs; model handler rebuilds config options
 - `syncSessionConfigState()`: handles `fast_mode` and `effort_level`
 - `prompt()` result handler: syncs `fast_mode_state` from SDK result messages
-- `getAvailableModels()`: returns `{ models, modelInfos }` instead of just `SessionModelState`
-- `createSession()`: initializes new session fields and passes them to `buildConfigOptions()`
+- `createSession()`: initializes new session fields (including `modelInfos` from `initializationResult.models`), passes them to `buildConfigOptions()`
 
 ## How to Merge Upstream Updates
 
@@ -104,9 +103,9 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - `createFileEditInterceptor` block (~5 lines in `createSession()` after capabilities check)
    - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
-   - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`, `getAvailableModels()` returns `{ models, modelInfos }`
+   - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`
 
-   If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, `setSessionConfigOption()`, or `getAvailableModels()`, our blocks need to stay in the same logical positions.
+   If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, or `setSessionConfigOption()`, our blocks need to stay in the same logical positions.
 
 2. **`src/tools.ts`** — Our changes are:
    - `fs` import addition at the top
@@ -182,6 +181,15 @@ npm run build          # TypeScript compilation
 npm run test:run       # Unit tests (95 tests)
 npm run test:integration  # Integration tests (requires RUN_INTEGRATION_TESTS=true)
 ```
+
+## README Structure
+
+The `README.md` is structured in two parts separated by a horizontal rule (`---`):
+
+1. **Fork section** (top) — Our user-facing documentation: overview, how it works, background, setup, features, development, and merge compatibility table.
+2. **Upstream README** (bottom) — The full upstream `README.md` reproduced verbatim under an "Upstream README" heading.
+
+When merging upstream updates, check if the upstream `README.md` changed and update the bottom section to match. The fork section at the top should only change when our fork's functionality changes.
 
 ## Setup in Zed
 

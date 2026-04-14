@@ -788,7 +788,7 @@ export const createPostToolUseHook =
       // Track file reads so Edit/Write intercept can enforce read-before-edit
       if (input.tool_name === "Read" && input.tool_input?.file_path && options?.onFileRead) {
         const content = extractReadContent(input.tool_response);
-        if (content != null) {
+        if (content !== null) {
           options.onFileRead(input.tool_input.file_path, content);
         }
       }
@@ -827,7 +827,7 @@ function extractReadContent(toolResponse: unknown): string | null {
 function isToolError(toolResponse: unknown): boolean {
   if (!toolResponse || typeof toolResponse !== "object") return false;
   const resp = toolResponse as Record<string, unknown>;
-  return resp.is_error === true || resp.error != null;
+  return resp.is_error === true;
 }
 
 /**
@@ -898,7 +898,7 @@ export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEdi
 
       // --- Revert file to pre-edit state ---
       try {
-        if (originalContent != null) {
+        if (originalContent !== undefined) {
           fs.writeFileSync(filePath, originalContent);
         } else if (toolName === "Write" && !fs.existsSync(filePath)) {
           // File didn't exist before Write created it — nothing to revert

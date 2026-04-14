@@ -56,7 +56,6 @@ import {
   SDKPartialAssistantMessage,
   SDKResultMessage,
   SDKUserMessage,
-  Settings,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
@@ -675,7 +674,7 @@ export class ClaudeAcpAgent implements Agent {
               case "task_started":
               case "task_notification":
               case "task_progress":
-
+              case "task_updated":
               case "elicitation_complete":
               case "api_retry":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
@@ -1110,12 +1109,12 @@ export class ClaudeAcpAgent implements Agent {
       );
     } else if (params.configId === "fast_mode") {
       const fastMode = resolvedValue === "fast";
-      await session.query.applyFlagSettings({ fastMode } as Settings);
+      await session.query.applyFlagSettings({ fastMode });
       session.fastModeState = fastMode ? "on" : "off";
     } else if (params.configId === "effort_level") {
       await session.query.applyFlagSettings({
-        effortLevel: resolvedValue as Settings["effortLevel"],
-      } as Settings);
+        effortLevel: resolvedValue as "low" | "medium" | "high",
+      });
       session.effortLevel = resolvedValue as "low" | "medium" | "high";
     }
 
@@ -1143,7 +1142,7 @@ export class ClaudeAcpAgent implements Agent {
         throw new Error("Invalid Mode");
     }
     try {
-      await this.sessions[sessionId].query.setPermissionMode(modeId as PermissionMode);
+      await this.sessions[sessionId].query.setPermissionMode(modeId);
     } catch (error) {
       if (error instanceof Error) {
         if (!error.message) {
@@ -1630,11 +1629,8 @@ export class ClaudeAcpAgent implements Agent {
       );
     }
 
-    const { models, modelInfos } = await getAvailableModels(
-      q,
-      initializationResult.models,
-      settingsManager,
-    );
+    const models = await getAvailableModels(q, initializationResult.models, settingsManager);
+    const modelInfos = initializationResult.models;
 
     const availableModes = [
       {
@@ -1678,21 +1674,6 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     const initialFastModeState = initializationResult.fast_mode_state ?? "off";
-
-    this.logger.log(
-      "[DEBUG] modelInfos:",
-      JSON.stringify(
-        modelInfos.map((m) => ({
-          value: m.value,
-          displayName: m.displayName,
-          supportsEffort: m.supportsEffort,
-          supportedEffortLevels: m.supportedEffortLevels,
-          supportsFastMode: m.supportsFastMode,
-        })),
-      ),
-    );
-    this.logger.log("[DEBUG] initialFastModeState:", initialFastModeState);
-    this.logger.log("[DEBUG] currentModelId:", models.currentModelId);
 
     const configOptions = buildConfigOptions(
       modes,
@@ -1924,7 +1905,7 @@ async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   settingsManager: SettingsManager,
-): Promise<{ models: SessionModelState; modelInfos: ModelInfo[] }> {
+): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -1948,15 +1929,12 @@ async function getAvailableModels(
   await query.setModel(currentModel.value);
 
   return {
-    models: {
-      availableModels: models.map((model) => ({
-        modelId: model.value,
-        name: model.displayName,
-        description: model.description,
-      })),
-      currentModelId: currentModel.value,
-    },
-    modelInfos: models,
+    availableModels: models.map((model) => ({
+      modelId: model.value,
+      name: model.displayName,
+      description: model.description,
+    })),
+    currentModelId: currentModel.value,
   };
 }
 
@@ -2344,6 +2322,7 @@ export function toAcpNotifications(
       case "container_upload":
       case "compaction":
       case "compaction_delta":
+      case "advisor_tool_result":
         break;
 
       default:

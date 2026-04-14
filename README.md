@@ -98,6 +98,11 @@ The main feature. When Claude edits or creates a file, the change appears in Zed
 - **Project-scoped** — Only files within the project directory are intercepted. Files outside the project (e.g., `~/.claude/settings.json`) are written directly by the built-in tools.
 - **Safe fallback** — If ACP routing fails, the new content is restored to disk so the edit isn't lost. Uncached files (never explicitly Read) skip the revert step.
 
+### Session Config Options
+
+- **Effort level selector** — When the model supports it, a "thought level" config option appears in the session config.
+- **Fast mode toggle** — When the model supports it, an Off/Fast toggle appears. Server-side transitions (e.g., cooldown) are synced back to the UI.
+
 ### All Upstream Features
 
 Everything else works unchanged:
@@ -123,7 +128,7 @@ This fork is designed for easy merges. All changes are additive:
 
 | File | Change | Merge notes |
 |------|--------|-------------|
-| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications` | All changes are purely additive insertion blocks |
+| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, session config options for effort/fast mode | All changes are purely additive insertion blocks |
 | `src/tools.ts` | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook` | Additions at end of file; shouldn't conflict |
 | `src/lib.ts` | 2 export lines (`createFileEditInterceptor`, `FileEditInterceptor` type) | Re-add if upstream changes exports |
 | `package.json` | No changes | — |
@@ -133,3 +138,33 @@ See [CLAUDE.md](./CLAUDE.md) for detailed merge instructions and architecture do
 ## License
 
 Apache-2.0 (same as upstream)
+
+---
+
+# Upstream README
+
+# ACP adapter for the Claude Agent SDK
+
+[![npm](https://img.shields.io/npm/v/%40agentclientprotocol%2Fclaude-agent-acp)](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
+
+Use [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview#branding-guidelines) from [ACP-compatible](https://agentclientprotocol.com) clients!
+
+This tool implements an ACP agent by using the official [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview), supporting:
+
+- Context @-mentions
+- Images
+- Tool calls (with permission requests)
+- Following
+- Edit review
+- TODO lists
+- Interactive (and background) terminals
+- Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
+- Client MCP servers
+
+Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
+
+## Contribution Policy
+
+This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:
+
+> By contributing to this project, you agree that your contributions will be licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0). You affirm that you have the legal right to submit your work, that you are not including code you do not have rights to, and that you understand contributions are made without requiring a Contributor License Agreement (CLA).
