@@ -96,7 +96,16 @@ The main feature. When Claude edits or creates a file, the change appears in Zed
 - **Subagent compatibility** — Works for both the main session and subagents (Task tool). The previous MCP-based approach failed silently for subagents.
 - **No tool redirection** — Claude uses its built-in Edit/Write tools naturally. The PostToolUse hook intercepts after execution — no system prompt or PreToolUse hook needed.
 - **Project-scoped** — Only files within the project directory are intercepted. Files outside the project (e.g., `~/.claude/settings.json`) are written directly by the built-in tools.
+- **`.context/` bypass** — Files inside `.context/` are written directly to disk without the review UI, since these are internal working files (plans, etc.) that shouldn't require manual approval.
 - **Safe fallback** — If ACP routing fails, the new content is restored to disk so the edit isn't lost. Uncached files (never explicitly Read) skip the revert step.
+
+### `.context` Directory
+
+Plan files and other context artifacts are stored in `.context/` within the project directory instead of `~/.claude/plans/`.
+
+- **Plans directory** — Set to `.context/plans` via SDK settings so plan files live in the project rather than the global Claude config.
+- **Git-excluded** — On session creation, `.context` is automatically appended to `.git/info/exclude` if not already present, keeping it out of version control without modifying `.gitignore`.
+- **Review UI bypass** — Edits to files inside `.context/` are applied directly to disk, skipping the Review Changes flow.
 
 ### Session Config Options
 
@@ -128,8 +137,8 @@ This fork is designed for easy merges. All changes are additive:
 
 | File | Change | Merge notes |
 |------|--------|-------------|
-| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, session config options for effort/fast mode | All changes are purely additive insertion blocks |
-| `src/tools.ts` | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook` | Additions at end of file; shouldn't conflict |
+| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, session config options for effort/fast mode, `.context` git-exclude on session creation, `plansDirectory` setting | All changes are purely additive insertion blocks |
+| `src/tools.ts` | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook`, `.context/` bypass in interceptor | Additions at end of file; shouldn't conflict |
 | `src/lib.ts` | 2 export lines (`createFileEditInterceptor`, `FileEditInterceptor` type) | Re-add if upstream changes exports |
 | `package.json` | No changes | — |
 

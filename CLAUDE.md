@@ -77,6 +77,22 @@ Added exports:
 export { ..., createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
 ```
 
+### `.context` Directory Support
+
+This fork stores plan files in `.context/plans/` within the project directory instead of the default `~/.claude/plans/`.
+
+Changes in `src/acp-agent.ts`:
+
+1. **`fs` import** — `import * as fs from "node:fs"` added at the top.
+
+2. **`plansDirectory` setting** — In `createSession()`, the SDK `Options` object includes `settings: { plansDirectory: ".context/plans" }`, which overrides the default plans directory via the highest-priority "flag settings" layer.
+
+3. **`.git/info/exclude` auto-update** — In `createSession()`, after `settingsManager.initialize()`, reads `.git/info/exclude` and appends `.context` if not already present. Silently skips if the file doesn't exist (non-git repos).
+
+Changes in `src/tools.ts`:
+
+4. **`.context/` bypass in `FileEditInterceptor`** — Files inside `<cwd>/.context/` skip the Review Changes UI and are written directly to disk. This is checked in `interceptEditWrite` right after the project-scope check.
+
 ### Session Config Improvements
 
 In addition to the FileEditInterceptor, this fork adds model-aware session config options:
@@ -100,7 +116,10 @@ In addition to the FileEditInterceptor, this fork adds model-aware session confi
 When pulling changes from `zed-industries/claude-agent-acp`:
 
 1. **`src/acp-agent.ts`** — Our changes are isolated insertion blocks:
+   - `fs` import at the top
    - `createFileEditInterceptor` block (~5 lines in `createSession()` after capabilities check)
+   - `.context` git-exclude block (~8 lines in `createSession()` after `settingsManager.initialize()`)
+   - `settings: { plansDirectory: ".context/plans" }` in the `Options` object
    - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
    - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`
@@ -110,6 +129,7 @@ When pulling changes from `zed-industries/claude-agent-acp`:
 2. **`src/tools.ts`** — Our changes are:
    - `fs` import addition at the top
    - `extractReadContent`, `isToolError`, `FileEditInterceptor`, `createFileEditInterceptor` appended at end of file
+   - `.context/` bypass check in `interceptEditWrite` (after the project-scope check)
    - `onFileRead` option added to `createPostToolUseHook`
 
    If upstream adds new tool handling, our additions are all at the end of the file and shouldn't conflict.
