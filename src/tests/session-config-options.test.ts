@@ -96,12 +96,13 @@ describe("session config options", () => {
       cancelled: false,
       permissionMode: "default",
       settingsManager: {},
-      configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       modes: structuredClone(MOCK_MODES),
       models: structuredClone(MOCK_MODELS),
+      configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       modelInfos: [],
       fastModeState: "off",
       effortLevel: "high",
+      contextWindowSize: 200000,
     };
   }
 
