@@ -53,6 +53,7 @@ import {
   PermissionMode,
   Query,
   query,
+  Settings,
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
@@ -143,6 +144,7 @@ type Session = {
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
   models: SessionModelState;
+  modelInfos: ModelInfo[];
   configOptions: SessionConfigOption[];
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
@@ -151,8 +153,6 @@ type Session = {
   abortController: AbortController;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   fastModeState: "off" | "cooldown" | "on";
-  effortLevel: "low" | "medium" | "high";
-  modelInfos: ModelInfo[];
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Defaults to
@@ -288,14 +288,34 @@ export type ToolUseCache = {
   };
 };
 
-function isStaticBinary(): boolean {
-  return process.env.CLAUDE_AGENT_ACP_IS_SINGLE_FILE_BUN !== undefined;
-}
-
 export async function claudeCliPath(): Promise<string> {
-  return isStaticBinary()
-    ? (await import("@anthropic-ai/claude-agent-sdk/embed")).default
-    : import.meta.resolve("@anthropic-ai/claude-agent-sdk").replace("sdk.mjs", "cli.js");
+  if (process.env.CLAUDE_CODE_EXECUTABLE) {
+    return process.env.CLAUDE_CODE_EXECUTABLE;
+  }
+  // The SDK's CLI is a native binary shipped as a platform-specific optional
+  // dependency of @anthropic-ai/claude-agent-sdk. Resolve via a require bound
+  // to the SDK so nested installs are found even when npm doesn't hoist.
+  const { createRequire } = await import("node:module");
+  const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
+  const ext = process.platform === "win32" ? ".exe" : "";
+  const candidates =
+    process.platform === "linux"
+      ? [
+          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
+          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+        ]
+      : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
+  for (const candidate of candidates) {
+    try {
+      return req.resolve(candidate);
+    } catch {
+      // try next candidate
+    }
+  }
+  throw new Error(
+    `Claude native binary not found for ${process.platform}-${process.arch}. ` +
+      `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
+  );
 }
 
 function shouldHideClaudeAuth(): boolean {
@@ -745,6 +765,7 @@ export class ClaudeAcpAgent implements Agent {
               case "memory_recall":
               case "notification":
               case "api_retry":
+              case "mirror_error":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -907,7 +928,7 @@ export class ClaudeAcpAgent implements Agent {
                   // Only upgrade from the default — once a `result` has given
                   // us an authoritative window, trust it over the heuristic.
                   // Model switches invalidate the cached window via
-                  // `syncSessionConfigState`, which resets us back to the
+                  // `applyConfigOptionValue`, which resets us back to the
                   // default so this branch runs again for the new model.
                   if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
                     const inferred = inferContextWindowFromModel(model);
@@ -1224,12 +1245,7 @@ export class ClaudeAcpAgent implements Agent {
       disallowedTools: ["*"],
       systemPrompt: { type: "preset", preset: "claude_code" },
       settingSources: ["user", "project", "local"],
-      executable: isStaticBinary() ? undefined : (process.execPath as any),
-      ...(process.env.CLAUDE_CODE_EXECUTABLE
-        ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
-        : isStaticBinary()
-          ? { pathToClaudeCodeExecutable: await claudeCliPath() }
-          : {}),
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
       ...(canResume ? { resume: params.sessionId } : {}),
     };
 
@@ -1336,11 +1352,17 @@ export class ClaudeAcpAgent implements Agent {
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
-    await this.sessions[params.sessionId].query.setModel(params.modelId);
-    await this.updateConfigOption(params.sessionId, "model", params.modelId);
+    // Resolve aliases (e.g. "opus", "opus[1m]") to canonical model IDs so
+    // downstream lookups in modelInfos succeed and the effort option isn't
+    // silently dropped.
+    const resolved = resolveModelPreference(session.modelInfos, params.modelId);
+    const modelId = resolved?.value ?? params.modelId;
+    await session.query.setModel(modelId);
+    await this.updateConfigOption(params.sessionId, "model", modelId);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1409,46 +1431,13 @@ export class ClaudeAcpAgent implements Agent {
       });
     } else if (params.configId === "model") {
       await session.query.setModel(resolvedValue);
-      // Rebuild happens below, after syncSessionConfigState refreshes
-      // contextWindowSize so the context_display labels match immediately.
-    } else if (params.configId === "fast_mode") {
-      const fastMode = resolvedValue === "fast";
-      await session.query.applyFlagSettings({ fastMode });
-      session.fastModeState = fastMode ? "on" : "off";
-    } else if (params.configId === "effort_level") {
-      await session.query.applyFlagSettings({
-        effortLevel: resolvedValue as "low" | "medium" | "high",
-      });
-      session.effortLevel = resolvedValue as "low" | "medium" | "high";
-    } else if (params.configId === "context_display") {
-      session.contextDisplayView = resolvedValue as ContextDisplayView;
     }
+    // Everything else (state sync, configOptions update, SDK flag settings for
+    // effort/fast_mode, context_display view) is handled inside
+    // applyConfigOptionValue so direct changes and model-induced changes go
+    // through the same path.
 
-    this.syncSessionConfigState(session, params.configId, resolvedValue);
-
-    if (params.configId === "model") {
-      // Invalidate effectiveMax — it was computed for the previous model's
-      // window. The next `result` will re-fetch via `getContextUsage()`.
-      session.contextDisplayState = {
-        ...session.contextDisplayState,
-        rawMax: session.contextWindowSize,
-        effectiveMax: null,
-      };
-      session.configOptions = buildConfigOptions(
-        session.modes,
-        session.models,
-        session.modelInfos,
-        session.effortLevel,
-        session.fastModeState,
-        { view: session.contextDisplayView, state: session.contextDisplayState },
-      );
-    }
-
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === params.configId && typeof o.currentValue === "string"
-        ? { ...o, currentValue: resolvedValue }
-        : o,
-    );
+    await this.applyConfigOptionValue(session, params.configId, resolvedValue);
 
     return { configOptions: session.configOptions };
   }
@@ -1680,11 +1669,7 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[sessionId];
     if (!session) return;
 
-    this.syncSessionConfigState(session, configId, value);
-
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
-    );
+    await this.applyConfigOptionValue(session, configId, value);
 
     await this.client.sessionUpdate({
       sessionId,
@@ -1723,7 +1708,12 @@ export class ClaudeAcpAgent implements Agent {
     });
   }
 
-  private syncSessionConfigState(session: Session, configId: string, value: string): void {
+  private async applyConfigOptionValue(
+    session: Session,
+    configId: string,
+    value: string,
+  ): Promise<void> {
+    // Sync top-level session state
     if (configId === "mode") {
       session.modes = { ...session.modes, currentModeId: value };
     } else if (configId === "model") {
@@ -1736,9 +1726,53 @@ export class ClaudeAcpAgent implements Agent {
       }
       session.models = { ...session.models, currentModelId: value };
     } else if (configId === "fast_mode") {
-      session.fastModeState = value === "fast" ? "on" : "off";
-    } else if (configId === "effort_level") {
-      session.effortLevel = value as "low" | "medium" | "high";
+      const fastMode = value === "fast";
+      await session.query.applyFlagSettings({ fastMode });
+      session.fastModeState = fastMode ? "on" : "off";
+    } else if (configId === "context_display") {
+      session.contextDisplayView = value as ContextDisplayView;
+    }
+
+    // Update configOptions
+    if (configId === "model") {
+      // Invalidate effectiveMax — it was computed for the previous model's
+      // window. The next `result` will re-fetch via `getContextUsage()`.
+      session.contextDisplayState = {
+        ...session.contextDisplayState,
+        rawMax: session.contextWindowSize,
+        effectiveMax: null,
+      };
+      // Rebuild config options since effort levels depend on the selected model
+      const effortOpt = session.configOptions.find((o) => o.id === "effort");
+      const currentEffort =
+        typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
+      session.configOptions = buildConfigOptions(
+        session.modes,
+        session.models,
+        session.modelInfos,
+        currentEffort,
+        session.fastModeState,
+        { view: session.contextDisplayView, state: session.contextDisplayState },
+      );
+
+      // Sync effort with the SDK if it changed after the model switch
+      const newEffortOpt = session.configOptions.find((o) => o.id === "effort");
+      const newEffort =
+        typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
+      if (newEffort !== currentEffort) {
+        await session.query.applyFlagSettings({
+          effortLevel: newEffort as Settings["effortLevel"],
+        });
+      }
+    } else {
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
+      if (configId === "effort") {
+        await session.query.applyFlagSettings({
+          effortLevel: value as Settings["effortLevel"],
+        });
+      }
     }
   }
 
@@ -1915,14 +1949,7 @@ export class ClaudeAcpAgent implements Agent {
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
-      // note: although not documented by the types, passing an absolute path
-      // here works to find zed's managed node version.
-      executable: isStaticBinary() ? undefined : (process.execPath as any),
-      ...(process.env.CLAUDE_CODE_EXECUTABLE
-        ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
-        : isStaticBinary()
-          ? { pathToClaudeCodeExecutable: await claudeCliPath() }
-          : {}),
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",
@@ -2077,11 +2104,19 @@ export class ClaudeAcpAgent implements Agent {
     const configOptions = buildConfigOptions(
       modes,
       models,
-      modelInfos,
-      "high",
+      initializationResult.models,
+      settingsManager.getSettings().effortLevel,
       initialFastModeState,
       { view: initialContextDisplayView, state: initialContextDisplayState },
     );
+
+    // Apply the initial effort level to the SDK so it matches the UI default
+    const initialEffort = configOptions.find((o) => o.id === "effort");
+    if (initialEffort && typeof initialEffort.currentValue === "string") {
+      await q.applyFlagSettings({
+        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
+      });
+    }
 
     this.sessions[sessionId] = {
       query: q,
@@ -2098,6 +2133,7 @@ export class ClaudeAcpAgent implements Agent {
       },
       modes,
       models,
+      modelInfos: initializationResult.models,
       configOptions,
       promptRunning: false,
       pendingMessages: new Map(),
@@ -2106,8 +2142,6 @@ export class ClaudeAcpAgent implements Agent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       fastModeState: initialFastModeState,
-      effortLevel: "high",
-      modelInfos,
       contextWindowSize: initialRawMax,
       contextDisplayView: initialContextDisplayView,
       contextDisplayState: initialContextDisplayState,
@@ -2200,7 +2234,7 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
-  modelInfos?: ModelInfo[],
+  modelInfos: ModelInfo[],
   currentEffortLevel?: string,
   fastModeState?: "off" | "cooldown" | "on",
   contextDisplay?: { view: ContextDisplayView; state: ContextDisplayState },
@@ -2234,20 +2268,41 @@ function buildConfigOptions(
     },
   ];
 
-  const currentModelInfo = modelInfos?.find((m) => m.value === models.currentModelId);
+  // Add effort level option based on the currently selected model
+  const currentModelInfo = modelInfos.find((m) => m.value === models.currentModelId);
+  const supportedLevels = currentModelInfo?.supportsEffort
+    ? (currentModelInfo.supportedEffortLevels ?? [])
+    : [];
 
-  if (currentModelInfo?.supportsEffort && currentModelInfo.supportedEffortLevels?.length) {
+  if (supportedLevels.length > 0) {
+    const effortOptions = supportedLevels.map((level) => ({
+      value: level,
+      name: level
+        .split(/[_-]/)
+        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+        .join(" "),
+    }));
+
+    // Keep the current level if valid, otherwise prefer xhigh (Claude Code's
+    // recommended default for capable models), then high (the API default).
+    const includes = (l: string) => (supportedLevels as string[]).includes(l);
+    const validEffort =
+      currentEffortLevel && includes(currentEffortLevel)
+        ? currentEffortLevel
+        : includes("xhigh")
+          ? "xhigh"
+          : includes("high")
+            ? "high"
+            : supportedLevels[0];
+
     options.push({
-      id: "effort_level",
+      id: "effort",
       name: "Effort",
+      description: "Available effort levels for this model",
+      category: "effort",
       type: "select",
-      category: "thought_level",
-      description: "How much the model thinks before responding",
-      currentValue: currentEffortLevel ?? "high",
-      options: currentModelInfo.supportedEffortLevels.map((level) => ({
-        value: level,
-        name: level.charAt(0).toUpperCase() + level.slice(1),
-      })),
+      currentValue: validEffort,
+      options: effortOptions,
     });
   }
 
