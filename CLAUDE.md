@@ -135,6 +135,7 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
    - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`
    - `context_display` dropdown: import from `./context-display.js`, `Session` fields (`contextDisplayView`, `contextDisplayState`), `buildConfigOptions()` `contextDisplay` param, `pushContextDisplayOption()` method, `prompt()` result-handler state update + one-shot `getContextUsage()` fetch, `compact_boundary` reset, `setSessionConfigOption()` `context_display` branch, `setSessionConfigOption()` model branch re-derives `contextDisplayState.rawMax`
+   - `CLAUDE_CODE_THINKING_DISPLAY` env-var opt-in (~8 lines in `createSession()` near `maxThinkingTokens`): reads `process.env.CLAUDE_CODE_THINKING_DISPLAY` (`"summarized"` or `"omitted"`), spreads `thinking: { type: "adaptive", display }` into `Options` only when set. Opus 4.7 defaults `display` to `"omitted"`; this restores populated thinking streams when users opt in via Zed's `agent_servers.env`.
 
    If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, or `setSessionConfigOption()`, our blocks need to stay in the same logical positions.
 

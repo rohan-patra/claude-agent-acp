@@ -1910,6 +1910,15 @@ export class ClaudeAcpAgent implements Agent {
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
       : undefined;
 
+    // Opt-in thinking display override. Opus 4.7 defaults to "omitted", so thinking
+    // blocks stream with an empty body. Set CLAUDE_CODE_THINKING_DISPLAY=summarized
+    // to restore a populated thinking stream. Unset → SDK default.
+    const thinkingDisplayEnv = process.env.CLAUDE_CODE_THINKING_DISPLAY;
+    const thinkingDisplay =
+      thinkingDisplayEnv === "summarized" || thinkingDisplayEnv === "omitted"
+        ? thinkingDisplayEnv
+        : undefined;
+
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
 
@@ -1927,10 +1936,9 @@ export class ClaudeAcpAgent implements Agent {
       systemPrompt,
       settings: { plansDirectory: ".context/plans" },
       settingSources: ["user", "project", "local"],
-      // Opt back into summarized thinking — Opus 4.7 changed the default so
-      // thinking blocks stream but `thinking` is empty unless `display` is set.
-      // Applies for every effort level; overridable by userProvidedOptions.thinking.
-      thinking: { type: "adaptive", display: "summarized" },
+      // Opt-in thinking display override via CLAUDE_CODE_THINKING_DISPLAY.
+      // Unset → SDK default (Opus 4.7 = "omitted"). Overridable by userProvidedOptions.thinking.
+      ...(thinkingDisplay && { thinking: { type: "adaptive", display: thinkingDisplay } }),
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
       env: {

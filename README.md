@@ -82,6 +82,13 @@ Add to your Zed settings (`~/.config/zed/settings.json`):
 
 Restart Zed. The custom agent will appear in the Agent Panel under the `+` menu.
 
+#### Optional env vars
+
+Add an `env` block to the `agent_servers` entry above to opt into extras:
+
+- `CLAUDE_CODE_THINKING_DISPLAY=summarized` — Restore the pre-Opus-4.7 summarized thinking stream (Opus 4.7 defaults to `omitted`, which streams empty thinking blocks). Accepts `summarized` or `omitted`. Unset → SDK default.
+- `MAX_THINKING_TOKENS=<number>` — Override the default thinking token budget.
+
 ## Features
 
 Everything from the upstream adapter, plus:
