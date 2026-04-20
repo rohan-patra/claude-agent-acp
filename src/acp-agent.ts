@@ -1893,6 +1893,10 @@ export class ClaudeAcpAgent implements Agent {
       systemPrompt,
       settings: { plansDirectory: ".context/plans" },
       settingSources: ["user", "project", "local"],
+      // Opt back into summarized thinking — Opus 4.7 changed the default so
+      // thinking blocks stream but `thinking` is empty unless `display` is set.
+      // Applies for every effort level; overridable by userProvidedOptions.thinking.
+      thinking: { type: "adaptive", display: "summarized" },
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
       env: {
