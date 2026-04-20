@@ -66,6 +66,11 @@ import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { SettingsManager } from "./settings.js";
 import {
+  buildContextDisplayOption,
+  type ContextDisplayState,
+  type ContextDisplayView,
+} from "./context-display.js";
+import {
   ClaudePlanEntry,
   createFileEditInterceptor,
   createPostToolUseHook,
@@ -154,6 +159,12 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Which variant the "Context" dropdown shows on its closed button. */
+  contextDisplayView: ContextDisplayView;
+  /** Inputs for re-rendering the context_display option's labels. `used` is
+   *  null until the first `result` reports usage; `autoCompactThreshold` is
+   *  fetched once per session via `query.getContextUsage()`. */
+  contextDisplayState: ContextDisplayState;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -665,6 +676,12 @@ export class ClaudeAcpAgent implements Agent {
                     size: session.contextWindowSize,
                   },
                 });
+                session.contextDisplayState = {
+                  ...session.contextDisplayState,
+                  used: 0,
+                  rawMax: session.contextWindowSize,
+                };
+                await this.pushContextDisplayOption(message.session_id);
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -742,6 +759,30 @@ export class ClaudeAcpAgent implements Agent {
                   },
                 },
               });
+
+              // Refresh the context_display dropdown with SDK-authoritative
+              // figures. `ctx.maxTokens` already accounts for auto-compact so
+              // we don't need to interpret `autoCompactThreshold`'s units.
+              // Guards on `rawMaxTokens`/`maxTokens` mirror the init-time path
+              // so a spurious zero from the SDK doesn't blank out a good label.
+              try {
+                const ctx = await session.query.getContextUsage();
+                session.contextDisplayState = {
+                  used: ctx.totalTokens,
+                  rawMax: ctx.rawMaxTokens > 0 ? ctx.rawMaxTokens : session.contextWindowSize,
+                  effectiveMax:
+                    ctx.isAutoCompactEnabled && ctx.maxTokens > 0 ? ctx.maxTokens : null,
+                };
+              } catch (e) {
+                this.logger.error("getContextUsage failed", e);
+                // Fallback: per-turn usage + cached window, no compact signal.
+                session.contextDisplayState = {
+                  ...session.contextDisplayState,
+                  used: lastAssistantTotalUsage,
+                  rawMax: session.contextWindowSize,
+                };
+              }
+              await this.pushContextDisplayOption(params.sessionId);
             }
 
             // Sync fast mode state from SDK result
@@ -1169,13 +1210,8 @@ export class ClaudeAcpAgent implements Agent {
       });
     } else if (params.configId === "model") {
       await session.query.setModel(resolvedValue);
-      session.configOptions = buildConfigOptions(
-        session.modes,
-        { ...session.models, currentModelId: resolvedValue },
-        session.modelInfos,
-        session.effortLevel,
-        session.fastModeState,
-      );
+      // Rebuild happens below, after syncSessionConfigState refreshes
+      // contextWindowSize so the context_display labels match immediately.
     } else if (params.configId === "fast_mode") {
       const fastMode = resolvedValue === "fast";
       await session.query.applyFlagSettings({ fastMode });
@@ -1185,9 +1221,29 @@ export class ClaudeAcpAgent implements Agent {
         effortLevel: resolvedValue as "low" | "medium" | "high",
       });
       session.effortLevel = resolvedValue as "low" | "medium" | "high";
+    } else if (params.configId === "context_display") {
+      session.contextDisplayView = resolvedValue as ContextDisplayView;
     }
 
     this.syncSessionConfigState(session, params.configId, resolvedValue);
+
+    if (params.configId === "model") {
+      // Invalidate effectiveMax — it was computed for the previous model's
+      // window. The next `result` will re-fetch via `getContextUsage()`.
+      session.contextDisplayState = {
+        ...session.contextDisplayState,
+        rawMax: session.contextWindowSize,
+        effectiveMax: null,
+      };
+      session.configOptions = buildConfigOptions(
+        session.modes,
+        session.models,
+        session.modelInfos,
+        session.effortLevel,
+        session.fastModeState,
+        { view: session.contextDisplayView, state: session.contextDisplayState },
+      );
+    }
 
     session.configOptions = session.configOptions.map((o) =>
       o.id === params.configId && typeof o.currentValue === "string"
@@ -1431,6 +1487,34 @@ export class ClaudeAcpAgent implements Agent {
       o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
     );
 
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: session.configOptions,
+      },
+    });
+  }
+
+  /** Rebuild the `context_display` option from current session state and push
+   *  a `config_option_update` notification. Called whenever the data driving
+   *  its labels changes — i.e. after `result` (new token counts) and after
+   *  `compact_boundary` (tokens reset). Selection changes are handled by the
+   *  generic `currentValue` update path. */
+  private async pushContextDisplayOption(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const rebuilt = buildContextDisplayOption(
+      session.contextDisplayView,
+      session.contextDisplayState,
+    );
+    const existing = session.configOptions.find((o) => o.id === "context_display");
+    if (existing && contextDisplayOptionsEqual(existing, rebuilt)) {
+      return;
+    }
+    session.configOptions = session.configOptions.map((o) =>
+      o.id === "context_display" ? rebuilt : o,
+    );
     await this.client.sessionUpdate({
       sessionId,
       update: {
@@ -1764,12 +1848,36 @@ export class ClaudeAcpAgent implements Agent {
 
     const initialFastModeState = initializationResult.fast_mode_state ?? "off";
 
+    // Pre-fetch context-usage metadata so the dropdown can show the correct
+    // window size (e.g. "-/1M" for Opus 1M) before the first turn. The
+    // `inferContextWindowFromModel` regex doesn't know every model variant;
+    // the SDK does. `used: null` is preserved — we only care about sizes
+    // pre-turn. On failure, fall back to the inference heuristic.
+    let initialRawMax =
+      inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW;
+    let initialEffectiveMax: number | null = null;
+    try {
+      const ctx = await q.getContextUsage();
+      if (ctx.rawMaxTokens > 0) initialRawMax = ctx.rawMaxTokens;
+      if (ctx.isAutoCompactEnabled && ctx.maxTokens > 0) initialEffectiveMax = ctx.maxTokens;
+    } catch (e) {
+      this.logger.error("getContextUsage failed at session init", e);
+    }
+
+    const initialContextDisplayView: ContextDisplayView = "percent";
+    const initialContextDisplayState: ContextDisplayState = {
+      used: null,
+      rawMax: initialRawMax,
+      effectiveMax: initialEffectiveMax,
+    };
+
     const configOptions = buildConfigOptions(
       modes,
       models,
       modelInfos,
       "high",
       initialFastModeState,
+      { view: initialContextDisplayView, state: initialContextDisplayState },
     );
 
     this.sessions[sessionId] = {
@@ -1797,8 +1905,9 @@ export class ClaudeAcpAgent implements Agent {
       fastModeState: initialFastModeState,
       effortLevel: "high",
       modelInfos,
-      contextWindowSize:
-        inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      contextWindowSize: initialRawMax,
+      contextDisplayView: initialContextDisplayView,
+      contextDisplayState: initialContextDisplayState,
     };
 
     return {
@@ -1889,6 +1998,7 @@ function buildConfigOptions(
   modelInfos?: ModelInfo[],
   currentEffortLevel?: string,
   fastModeState?: "off" | "cooldown" | "on",
+  contextDisplay?: { view: ContextDisplayView; state: ContextDisplayState },
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -1951,7 +2061,27 @@ function buildConfigOptions(
     });
   }
 
+  if (contextDisplay) {
+    options.push(buildContextDisplayOption(contextDisplay.view, contextDisplay.state));
+  }
+
   return options;
+}
+
+/** Cheap structural check used by `pushContextDisplayOption` to skip no-op
+ *  `config_option_update` notifications when the per-turn rebuild produces
+ *  labels identical to what's already on the session. */
+function contextDisplayOptionsEqual(a: SessionConfigOption, b: SessionConfigOption): boolean {
+  if (a.type !== "select" || b.type !== "select") return false;
+  if (a.currentValue !== b.currentValue) return false;
+  if (a.options.length !== b.options.length) return false;
+  for (let i = 0; i < a.options.length; i++) {
+    const x = a.options[i];
+    const y = b.options[i];
+    if (!("value" in x) || !("value" in y)) return false;
+    if (x.value !== y.value || x.name !== y.name) return false;
+  }
+  return true;
 }
 
 // Claude Code CLI persists display strings like "opus[1m]" in settings,

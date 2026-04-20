@@ -103,13 +103,24 @@ In addition to the FileEditInterceptor, this fork adds model-aware session confi
 
 3. **Model capability tracking** — `Session` stores `modelInfos: ModelInfo[]` (the raw SDK model list). When the user switches models via `setSessionConfigOption("model", ...)`, `buildConfigOptions()` is called to rebuild the config options, showing or hiding effort/fast options based on the new model's capabilities.
 
+4. **`context_display` dropdown** — A "Context" select in the "model" category, always present with three always-visible options. Each option's `name` is a live-rendered label; `currentValue` picks which one shows on the closed button. Labels fall back to terse placeholders (with the window size still shown when known) when data is missing:
+   - `percent` — `"23%"` / `"-%"` (no data)
+   - `numeric` — `"45k/1M"` / `"-/1M"` (no usage yet; `rawMax` is known from `inferContextWindowFromModel` at session creation) / `"-/-"` (no window info). k/M abbreviations via `formatTokens` in `src/context-display.ts`.
+   - `until_compact` — `"139k to compact"` (`effectiveMax - used`) / `"at compact"` (remainder ≤ 0) / `"-"` (no data).
+
+   Backing data comes from `query.getContextUsage()`, called at session init (to seed `rawMax`/`effectiveMax` before any turn — SDK-authoritative, works correctly for variants like Opus 1M where the `inferContextWindowFromModel` regex would otherwise fall back to 200k) and on every `result`. `ctx.totalTokens`, `ctx.rawMaxTokens`, and `ctx.maxTokens` (when `ctx.isAutoCompactEnabled`) populate `used`, `rawMax`, and `effectiveMax` respectively — the SDK's `maxTokens` already accounts for auto-compact, so the agent never interprets `autoCompactThreshold` itself. On SDK errors the fallback is `inferContextWindowFromModel` at init / per-turn `lastAssistantTotalUsage` + `session.contextWindowSize` on `result`, with `effectiveMax` left null (until_compact shows `-`). On model change `effectiveMax` is invalidated (the next turn re-fetches). `pushContextDisplayOption` sends `config_option_update` on every `result` and `compact_boundary`, with a structural-equality short-circuit to skip no-op pushes.
+
 **Modified areas in `src/acp-agent.ts`:**
-- `Session` type: added `fastModeState`, `effortLevel`, `modelInfos` fields
-- `buildConfigOptions()`: accepts optional `modelInfos`, `currentEffortLevel`, `fastModeState` params; conditionally pushes `effort_level` and `fast_mode` options
-- `setSessionConfigOption()`: handles `fast_mode` and `effort_level` config IDs; model handler rebuilds config options
+- `Session` type: added `fastModeState`, `effortLevel`, `modelInfos`, `contextDisplayView`, `contextDisplayState` fields
+- `buildConfigOptions()`: accepts optional `modelInfos`, `currentEffortLevel`, `fastModeState`, `contextDisplay` params; conditionally pushes `effort_level`, `fast_mode`, and (always) `context_display` options
+- `setSessionConfigOption()`: handles `fast_mode`, `effort_level`, and `context_display` config IDs; model handler rebuilds config options and re-derives `contextDisplayState.rawMax`
 - `syncSessionConfigState()`: handles `fast_mode` and `effort_level`
-- `prompt()` result handler: syncs `fast_mode_state` from SDK result messages
-- `createSession()`: initializes new session fields (including `modelInfos` from `initializationResult.models`), passes them to `buildConfigOptions()`
+- `pushContextDisplayOption()`: private method — rebuilds the `context_display` option from current session state and fires `config_option_update`
+- `prompt()` result handler: syncs `fast_mode_state` from SDK result messages; updates `contextDisplayState` (and fetches `autoCompactThreshold` on first turn) then calls `pushContextDisplayOption()`
+- `prompt()` `compact_boundary` handler: resets `contextDisplayState.used = 0` and calls `pushContextDisplayOption()`
+- `createSession()`: initializes new session fields (including `modelInfos` from `initializationResult.models` and the initial context-display state), passes them to `buildConfigOptions()`
+
+**New file:** `src/context-display.ts` — pure formatters (`formatPercent`, `formatNumeric`, `formatUntilCompact`, `formatTokens`) and the `buildContextDisplayOption()` option builder. Covered by `src/tests/context-display.test.ts`.
 
 ## How to Merge Upstream Updates
 
@@ -123,6 +134,7 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
    - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`
+   - `context_display` dropdown: import from `./context-display.js`, `Session` fields (`contextDisplayView`, `contextDisplayState`), `buildConfigOptions()` `contextDisplay` param, `pushContextDisplayOption()` method, `prompt()` result-handler state update + one-shot `getContextUsage()` fetch, `compact_boundary` reset, `setSessionConfigOption()` `context_display` branch, `setSessionConfigOption()` model branch re-derives `contextDisplayState.rawMax`
 
    If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, or `setSessionConfigOption()`, our blocks need to stay in the same logical positions.
 

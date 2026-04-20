@@ -1354,6 +1354,8 @@ describe("stop reason propagation", () => {
       effortLevel: "high",
       modelInfos: [],
       contextWindowSize: 200000,
+      contextDisplayView: "percent",
+      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
     };
   }
 
@@ -1499,6 +1501,8 @@ describe("stop reason propagation", () => {
       effortLevel: "high",
       modelInfos: [],
       contextWindowSize: 200000,
+      contextDisplayView: "percent",
+      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
     };
 
     const response = await agent.prompt({
@@ -1578,6 +1582,8 @@ describe("session/close", () => {
       effortLevel: "high",
       modelInfos: [],
       contextWindowSize: 200000,
+      contextDisplayView: "percent",
+      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
     };
     return agent.sessions[sessionId]!;
   }
@@ -1676,6 +1682,8 @@ describe("getOrCreateSession param change detection", () => {
       effortLevel: "high",
       modelInfos: [],
       contextWindowSize: 200000,
+      contextDisplayView: "percent",
+      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
     };
     return agent.sessions[sessionId]!;
   }
@@ -1912,6 +1920,8 @@ describe("usage_update computation", () => {
       effortLevel: "high",
       modelInfos: [],
       contextWindowSize: 200000,
+      contextDisplayView: "percent",
+      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
     };
   }
 
@@ -2803,6 +2813,8 @@ describe("emitRawSDKMessages", () => {
       effortLevel: "high",
       modelInfos: [],
       contextWindowSize: 200000,
+      contextDisplayView: "percent",
+      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
     };
   }
 
