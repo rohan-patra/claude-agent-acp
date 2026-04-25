@@ -51,9 +51,11 @@ import {
   ModelUsage,
   Options,
   PermissionMode,
+  PermissionUpdate,
   Query,
   query,
   Settings,
+  SDKAssistantMessageError,
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
@@ -330,6 +332,56 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
+// The Claude SDK persists local slash command invocations (e.g. `/model`) and
+// their output as user messages in the session transcript, wrapping the
+// payload in these XML-like markers that the CLI uses for its own display.
+// The live prompt loop drops them; replay must strip them too or they leak
+// into the UI on session/load.
+const LOCAL_COMMAND_TAG_PATTERN =
+  /<(command-name|command-message|command-args|local-command-stdout|local-command-stderr)>[\s\S]*?<\/\1>/g;
+
+function stripMarkerTags(text: string): string {
+  return text.replace(LOCAL_COMMAND_TAG_PATTERN, "");
+}
+
+/**
+ * Return user-message content with local-command marker tags removed, or
+ * `null` if nothing meaningful remains (caller should skip the message).
+ * Preserves real prose that's mixed in alongside the markers — e.g. a
+ * message like `<command-name>…</command-name>hi` becomes `hi`.
+ */
+export function stripLocalCommandMetadata(content: unknown): unknown | null {
+  if (typeof content === "string") {
+    const stripped = stripMarkerTags(content);
+    return stripped.trim() === "" ? null : stripped;
+  }
+  if (!Array.isArray(content)) return content;
+
+  const kept: unknown[] = [];
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      "type" in block &&
+      (block as { type: unknown }).type === "text" &&
+      "text" in block &&
+      typeof (block as { text: unknown }).text === "string"
+    ) {
+      const stripped = stripMarkerTags((block as { text: string }).text);
+      if (stripped.trim() === "") continue;
+      kept.push({ ...(block as object), text: stripped });
+    } else {
+      kept.push(block);
+    }
+  }
+  if (kept.length === 0) return null;
+  return kept;
+}
+
+export function isLocalCommandMetadata(content: unknown): boolean {
+  return stripLocalCommandMetadata(content) === null;
+}
+
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
@@ -366,6 +418,50 @@ export function resolvePermissionMode(defaultMode?: unknown): PermissionMode {
   }
 
   return mapped;
+}
+
+/**
+ * Builds the label for the "Always Allow" permission option so the user can see
+ * the exact scope they are committing to. Uses the SDK-provided suggestions
+ * when available (e.g. `Bash(npm test:*)`) and falls back to naming the whole
+ * tool so "Always Allow" is never a blank check without disclosure.
+ */
+export function describeAlwaysAllow(
+  suggestions: PermissionUpdate[] | undefined,
+  toolName: string,
+): string {
+  if (!suggestions || suggestions.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  const ruleLabels: string[] = [];
+  const directories: string[] = [];
+
+  for (const update of suggestions) {
+    if (update.type === "addRules" && update.behavior === "allow") {
+      for (const rule of update.rules) {
+        ruleLabels.push(
+          rule.ruleContent ? `${rule.toolName}(${rule.ruleContent})` : `all ${rule.toolName}`,
+        );
+      }
+    } else if (update.type === "addDirectories") {
+      directories.push(...update.directories);
+    }
+  }
+
+  const parts: string[] = [];
+  if (ruleLabels.length > 0) {
+    parts.push(ruleLabels.join(", "));
+  }
+  if (directories.length > 0) {
+    parts.push(`access to ${directories.join(", ")}`);
+  }
+
+  if (parts.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  return `Always Allow ${parts.join(" and ")}`;
 }
 
 // Implement the ACP Agent interface
@@ -550,7 +646,7 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
-  async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
     // Needs to happen after we return the session
@@ -616,6 +712,13 @@ export class ClaudeAcpAgent implements Agent {
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
+    // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
+    // problem, billing), it sets a categorical `error` field on the
+    // `SDKAssistantMessage` that precedes the final `result` message. We
+    // capture it here so the subsequent `RequestError.internalError` can
+    // forward it to clients as structured `data`, sparing them from
+    // pattern-matching on the human-readable message text.
+    let lastAssistantError: SDKAssistantMessageError | undefined;
 
     const userMessage = promptToClaude(params);
 
@@ -866,7 +969,10 @@ export class ClaudeAcpAgent implements Agent {
                   break;
                 }
                 if (message.is_error) {
-                  throw RequestError.internalError(undefined, message.result);
+                  throw RequestError.internalError(
+                    errorKindData(lastAssistantError),
+                    message.result,
+                  );
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
@@ -891,7 +997,7 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 if (message.is_error) {
                   throw RequestError.internalError(
-                    undefined,
+                    errorKindData(lastAssistantError),
                     message.errors.join(", ") || message.subtype,
                   );
                 }
@@ -903,7 +1009,7 @@ export class ClaudeAcpAgent implements Agent {
               case "error_max_structured_output_retries":
                 if (message.is_error) {
                   throw RequestError.internalError(
-                    undefined,
+                    errorKindData(lastAssistantError),
                     message.errors.join(", ") || message.subtype,
                   );
                 }
@@ -1019,6 +1125,9 @@ export class ClaudeAcpAgent implements Agent {
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
               if (message.message.model && message.message.model !== "<synthetic>") {
                 lastAssistantModel = message.message.model;
+              }
+              if (message.error) {
+                lastAssistantError = message.error;
               }
             }
 
@@ -1341,7 +1450,7 @@ export class ClaudeAcpAgent implements Agent {
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
-  async unstable_closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
     }
@@ -1474,9 +1583,17 @@ export class ClaudeAcpAgent implements Agent {
     const messages = await getSessionMessages(sessionId);
 
     for (const message of messages) {
+      // @ts-expect-error - untyped in SDK but we handle all of these
+      let content: unknown = message.message.content;
+      // @ts-expect-error - untyped in SDK but we handle all of these
+      if (message.message.role === "user") {
+        content = stripLocalCommandMetadata(content);
+        if (content === null) continue;
+      }
+
       for (const notification of toAcpNotifications(
         // @ts-expect-error - untyped in SDK but we handle all of these
-        message.message.content,
+        content,
         // @ts-expect-error - untyped in SDK but we handle all of these
         message.message.role,
         sessionId,
@@ -1506,6 +1623,7 @@ export class ClaudeAcpAgent implements Agent {
 
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
+      const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
@@ -1596,7 +1714,7 @@ export class ClaudeAcpAgent implements Agent {
         options: [
           {
             kind: "allow_always",
-            name: "Always Allow",
+            name: alwaysAllowLabel,
             optionId: "allow_always",
           },
           { kind: "allow_once", name: "Allow", optionId: "allow" },
@@ -1890,10 +2008,16 @@ export class ClaudeAcpAgent implements Agent {
         systemPrompt = customPrompt;
       } else if (
         typeof customPrompt === "object" &&
-        "append" in customPrompt &&
-        typeof customPrompt.append === "string"
+        customPrompt !== null &&
+        !Array.isArray(customPrompt)
       ) {
-        systemPrompt.append = customPrompt.append;
+        // Forward all preset options (append, excludeDynamicSections, and
+        // anything the SDK adds later) while locking type/preset.
+        systemPrompt = {
+          ...(customPrompt as object),
+          type: "preset",
+          preset: "claude_code",
+        } as Options["systemPrompt"];
       }
     }
 
@@ -1919,6 +2043,9 @@ export class ClaudeAcpAgent implements Agent {
         ? thinkingDisplayEnv
         : undefined;
 
+    // Parse model configuration from environment (e.g. Bedrock model overrides)
+    const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
+
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
 
@@ -1934,13 +2061,34 @@ export class ClaudeAcpAgent implements Agent {
 
     const options: Options = {
       systemPrompt,
-      settings: { plansDirectory: ".context/plans" },
       settingSources: ["user", "project", "local"],
       // Opt-in thinking display override via CLAUDE_CODE_THINKING_DISPLAY.
       // Unset → SDK default (Opus 4.7 = "omitted"). Overridable by userProvidedOptions.thinking.
       ...(thinkingDisplay && { thinking: { type: "adaptive", display: thinkingDisplay } }),
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
+      // Merge our fork's plansDirectory with any caller- or env-provided settings.
+      // CLAUDE_MODEL_CONFIG env var is a fallback for model configuration (e.g. Bedrock
+      // model ID overrides) used only when the caller did not supply settings via _meta.
+      // Note: when userProvidedOptions.settings is a string (path), we can't merge —
+      // the caller has full control and we skip plansDirectory injection.
+      settings:
+        typeof userProvidedOptions?.settings === "string"
+          ? userProvidedOptions.settings
+          : {
+              plansDirectory: ".context/plans",
+              ...(userProvidedOptions?.settings ?? {}),
+              ...(!userProvidedOptions?.settings && modelConfig
+                ? {
+                    ...(modelConfig.modelOverrides && {
+                      modelOverrides: modelConfig.modelOverrides,
+                    }),
+                    ...(modelConfig.availableModels && {
+                      availableModels: modelConfig.availableModels,
+                    }),
+                  }
+                : {}),
+            },
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
@@ -2202,6 +2350,22 @@ function totalTokens(usage: UsageSnapshot): number {
     usage.cache_read_input_tokens +
     usage.cache_creation_input_tokens
   );
+}
+
+/**
+ * Build the `data` payload attached to a `RequestError.internalError` when we
+ * have a categorical error from the Claude SDK. Returns `undefined` when no
+ * categorical error is available, matching the previous behavior of passing
+ * `undefined` to `RequestError.internalError`.
+ *
+ * The `errorKind` field is a convention for ACP clients to dispatch on
+ * without having to pattern-match the human-readable message text. Clients
+ * that don't understand it fall back to the existing message-based rendering.
+ */
+function errorKindData(
+  errorKind: SDKAssistantMessageError | undefined,
+): { errorKind: SDKAssistantMessageError } | undefined {
+  return errorKind ? { errorKind } : undefined;
 }
 
 /** Project a nullable API usage object into our non-null snapshot shape.
@@ -2967,6 +3131,20 @@ function commonPrefixLength(a: string, b: string) {
 function inferContextWindowFromModel(model: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
   return null;
+}
+
+function parseModelConfig(
+  raw: string | undefined,
+): { modelOverrides?: Record<string, string>; availableModels?: string[] } | undefined {
+  if (!raw) return undefined;
+  const parsed = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("CLAUDE_MODEL_CONFIG must be a JSON object");
+  }
+  const result: { modelOverrides?: Record<string, string>; availableModels?: string[] } = {};
+  if (parsed.modelOverrides !== undefined) result.modelOverrides = parsed.modelOverrides;
+  if (parsed.availableModels !== undefined) result.availableModels = parsed.availableModels;
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentModel: string) {
