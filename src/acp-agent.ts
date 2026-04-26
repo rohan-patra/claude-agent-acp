@@ -77,6 +77,7 @@ import {
   ClaudePlanEntry,
   createFileEditInterceptor,
   createPostToolUseHook,
+  createPreToolUseHook,
   type FileEditInterceptor,
   planEntries,
   registerHookCallback,
@@ -2114,6 +2115,18 @@ export class ClaudeAcpAgent implements Agent {
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,
+        PreToolUse: [
+          ...(userProvidedOptions?.hooks?.PreToolUse || []),
+          {
+            hooks: [
+              createPreToolUseHook({
+                onPreWrite: fileEditInterceptor
+                  ? (filePath: string) => fileEditInterceptor.onPreWrite(filePath)
+                  : undefined,
+              }),
+            ],
+          },
+        ],
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {

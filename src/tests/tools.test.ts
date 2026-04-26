@@ -1316,6 +1316,61 @@ describe("FileEditInterceptor", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("deletes the file when Write created a new file (pre-Write captured non-existence)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-file-edit-"));
+
+    try {
+      const filePath = path.join(tmpDir, "new.txt");
+      const interceptor = createFileEditInterceptor(mockLogger, tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+
+      // PreToolUse fires before built-in Write — file doesn't exist yet.
+      interceptor.onPreWrite(filePath);
+      // Built-in Write executes and creates the file.
+      fs.writeFileSync(filePath, "fresh content");
+
+      await interceptor.interceptEditWrite(
+        "Write",
+        { file_path: filePath, content: "fresh content" },
+        { filePath, success: true, error: null },
+        writeTextFile,
+      );
+
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "fresh content");
+      // File should be deleted so Zed Review UI can show file creation.
+      expect(fs.existsSync(filePath)).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reverts to disk content captured at PreToolUse when Write overwrites an unread file", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-file-edit-"));
+
+    try {
+      const filePath = path.join(tmpDir, "existing.txt");
+      fs.writeFileSync(filePath, "original");
+      const interceptor = createFileEditInterceptor(mockLogger, tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+
+      // PreToolUse captures original disk content (no prior Read needed).
+      interceptor.onPreWrite(filePath);
+      fs.writeFileSync(filePath, "overwritten");
+
+      await interceptor.interceptEditWrite(
+        "Write",
+        { file_path: filePath, content: "overwritten" },
+        { filePath, success: true, error: null },
+        writeTextFile,
+      );
+
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "overwritten");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("original");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("subagent Edit/Write interception", () => {

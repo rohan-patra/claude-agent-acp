@@ -28,22 +28,26 @@ Additions appended at end of file:
 
 3. **`isToolError(toolResponse)`** — Checks if a tool response indicates an error (the response contains `is_error: true`).
 
-4. **`FileEditInterceptor` interface** — Two methods:
+4. **`FileEditInterceptor` interface** — Three methods:
    - `onFileRead(filePath, content)` — Caches file content when Read completes.
+   - `onPreWrite(filePath)` — Captures pre-Write file state (existence + content) so new-file Writes can be reverted by deleting, and uncached overwrites can be reverted from disk.
    - `interceptEditWrite(toolName, toolInput, toolResponse, writeTextFile)` — Reverts the disk write and routes through ACP.
 
-5. **`createFileEditInterceptor(logger)`** — Factory that returns a `FileEditInterceptor`. Contains a `fileContentCache` Map in its closure. The interceptor:
+5. **`createFileEditInterceptor(logger)`** — Factory that returns a `FileEditInterceptor`. Contains a `fileContentCache` Map and `nonExistentFiles` Set in its closure. The interceptor:
    - Lets the built-in Edit/Write tool execute normally (writing to disk)
    - Determines the new content (from disk for Edit, from `input.content` for Write)
-   - Reverts the file to its pre-edit state (or skips revert for uncached files)
+   - Reverts the file to its pre-edit state. For Write, if PreToolUse captured non-existence, the file is deleted; if PreToolUse captured existing disk content, that's restored. For Edit, the read-cache is used.
    - Routes the new content through `writeTextFile` → Zed's Review Changes UI
    - Updates the cache for consecutive edits
 
 6. **`createPostToolUseHook()` `onFileRead` option** — Extended with an optional `onFileRead(filePath, content)` callback that fires when the built-in Read tool completes, feeding the interceptor's cache via `extractReadContent`.
 
+7. **`createPreToolUseHook()` factory** — A PreToolUse hook factory parallel to `createPostToolUseHook`. Accepts an optional `onPreWrite(filePath)` callback that fires for `tool_name === "Write"`, feeding the interceptor's pre-existence/content cache.
+
 Key design decisions:
 - **PostToolUse intercept, not MCP** — Built-in Edit/Write execute normally, then the PostToolUse hook intercepts, reverts, and routes through ACP. This works for both main sessions and subagents (subagents use built-in tools directly, which the PostToolUse hook can intercept).
-- **No system prompt or PreToolUse hook needed** — Claude uses its built-in Edit/Write tools naturally. No tool redirection or MCP tool names to worry about.
+- **PreToolUse for Write only** — Edit relies on a prior Read (the built-in Edit tool requires it), so the read-cache is sufficient. Write doesn't require Read, so we capture pre-existence/content via PreToolUse. This lets us correctly revert Write of a brand-new file (delete) vs. overwrite of an existing file (restore).
+- **No system prompt needed** — Claude uses its built-in Edit/Write tools naturally. No tool redirection or MCP tool names to worry about.
 - **No `@modelcontextprotocol/sdk` dependency** — The MCP server is gone entirely.
 - **Read-before-edit cache** — The `fileContentCache` tracks what the agent last Read. Edits read the new content from disk (already written by the built-in Edit tool). If the file was modified externally since the last Read, the built-in Edit tool will fail on its own (`old_string` not found). Uncached files fall back to reading from disk and skip revert.
 - **Cache update after edit** — After a successful ACP route, the cache is updated with the new content so consecutive edits to the same file work without re-reading.
@@ -56,9 +60,11 @@ Changes in `createSession()`:
 
 2. **PostToolUse `onFileRead` wiring**: Passes `fileEditInterceptor.onFileRead` to `createPostToolUseHook()` so that when the built-in Read tool completes, `extractReadContent` extracts the file content and caches it.
 
+3. **PreToolUse `onPreWrite` wiring**: Adds a `PreToolUse` hooks block that calls `createPreToolUseHook()` with `fileEditInterceptor.onPreWrite`. This fires before the built-in Write tool executes so the interceptor can capture pre-existence and original disk content for correct revert.
+
 Changes in `toAcpNotifications()` and `streamEventToAcpNotifications()`:
 
-3. **`fileEditInterceptor` option**: Both functions accept an optional `fileEditInterceptor` in their options. In the `onPostToolUseHook` callback, if the tool is Edit or Write, the interceptor's `interceptEditWrite` is called with `client.writeTextFile` before the normal notification logic runs.
+4. **`fileEditInterceptor` option**: Both functions accept an optional `fileEditInterceptor` in their options. In the `onPostToolUseHook` callback, if the tool is Edit or Write, the interceptor's `interceptEditWrite` is called with `client.writeTextFile` before the normal notification logic runs.
 
 New imports at top of file:
 ```typescript
@@ -132,6 +138,7 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - `.context` git-exclude block (~8 lines in `createSession()` after `settingsManager.initialize()`)
    - `settings: { plansDirectory: ".context/plans" }` in the `Options` object
    - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
+   - PreToolUse hooks block calling `createPreToolUseHook` with `onPreWrite` (sibling to PostToolUse block)
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
    - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`
    - `context_display` dropdown: import from `./context-display.js`, `Session` fields (`contextDisplayView`, `contextDisplayState`), `buildConfigOptions()` `contextDisplay` param, `pushContextDisplayOption()` method, `prompt()` result-handler state update + one-shot `getContextUsage()` fetch, `compact_boundary` reset, `setSessionConfigOption()` `context_display` branch, `setSessionConfigOption()` model branch re-derives `contextDisplayState.rawMax`
@@ -141,9 +148,10 @@ When pulling changes from `zed-industries/claude-agent-acp`:
 
 2. **`src/tools.ts`** — Our changes are:
    - `fs` import addition at the top
-   - `extractReadContent`, `isToolError`, `FileEditInterceptor`, `createFileEditInterceptor` appended at end of file
-   - `.context/` bypass check in `interceptEditWrite` (after the project-scope check)
+   - `extractReadContent`, `isToolError`, `FileEditInterceptor`, `createFileEditInterceptor`, `createPreToolUseHook` appended at end of file
+   - `.context/` bypass check inside `isInScope` (used by both `onPreWrite` and `interceptEditWrite`)
    - `onFileRead` option added to `createPostToolUseHook`
+   - `onPreWrite` option on `createPreToolUseHook`; `nonExistentFiles` set in the interceptor's closure
 
    If upstream adds new tool handling, our additions are all at the end of the file and shouldn't conflict.
 

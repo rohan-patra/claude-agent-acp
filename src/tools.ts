@@ -769,6 +769,18 @@ export const registerHookCallback = (
   };
 };
 
+/* A callback for Claude Code that is called when receiving a PreToolUse hook */
+export const createPreToolUseHook =
+  (options?: { onPreWrite?: (filePath: string) => void }): HookCallback =>
+  async (input: any): Promise<{ continue: boolean }> => {
+    if (input.hook_event_name === "PreToolUse") {
+      if (input.tool_name === "Write" && input.tool_input?.file_path && options?.onPreWrite) {
+        options.onPreWrite(input.tool_input.file_path);
+      }
+    }
+    return { continue: true };
+  };
+
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
 export const createPostToolUseHook =
   (
@@ -839,6 +851,8 @@ function isToolError(toolResponse: unknown): boolean {
 export interface FileEditInterceptor {
   /** Cache file content when Read completes (via PostToolUse). */
   onFileRead: (filePath: string, content: string) => void;
+  /** Capture pre-Write file state (via PreToolUse) so we can revert correctly. */
+  onPreWrite: (filePath: string) => void;
   /** Revert disk write and route through ACP writeTextFile. */
   interceptEditWrite: (
     toolName: string,
@@ -850,11 +864,43 @@ export interface FileEditInterceptor {
 
 export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEditInterceptor {
   const fileContentCache = new Map<string, string>();
+  const nonExistentFiles = new Set<string>();
   const resolvedCwd = cwd ? path.resolve(cwd) : undefined;
+
+  // Files outside the project (e.g. ~/.claude/settings.json) and inside .context/
+  // should be handled by the native Claude Code tools without routing through ACP.
+  const isInScope = (filePath: string): boolean => {
+    if (!resolvedCwd) return true;
+    const resolvedFilePath = path.resolve(filePath);
+    if (!resolvedFilePath.startsWith(resolvedCwd + path.sep) && resolvedFilePath !== resolvedCwd) {
+      return false;
+    }
+    const contextDir = resolvedCwd + path.sep + ".context" + path.sep;
+    if (resolvedFilePath.startsWith(contextDir)) {
+      return false;
+    }
+    return true;
+  };
 
   return {
     onFileRead(filePath: string, content: string): void {
       fileContentCache.set(filePath, content);
+    },
+
+    onPreWrite(filePath: string): void {
+      if (!isInScope(filePath)) return;
+      try {
+        if (fs.existsSync(filePath)) {
+          // Always refresh from disk so revert restores the actual pre-Write
+          // state, even if the file was modified externally since the last Read.
+          fileContentCache.set(filePath, fs.readFileSync(filePath, "utf8"));
+          nonExistentFiles.delete(filePath);
+        } else {
+          nonExistentFiles.add(filePath);
+        }
+      } catch (e) {
+        logger.error(`[FileEditInterceptor] onPreWrite failed for ${filePath}: ${e}`);
+      }
     },
 
     async interceptEditWrite(toolName, toolInput, toolResponse, writeTextFile) {
@@ -863,24 +909,9 @@ export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEdi
       if (!filePath) return;
       if (isToolError(toolResponse)) return;
 
-      // Only intercept files within the project directory.
-      // Files outside the project (e.g. ~/.claude/settings.json) should be
-      // handled by the native Claude Code tools without routing through ACP.
-      if (resolvedCwd) {
-        const resolvedFilePath = path.resolve(filePath);
-        if (
-          !resolvedFilePath.startsWith(resolvedCwd + path.sep) &&
-          resolvedFilePath !== resolvedCwd
-        ) {
-          return;
-        }
-        // Skip .context/ files — these should apply directly without review UI.
-        const contextDir = resolvedCwd + path.sep + ".context" + path.sep;
-        if (resolvedFilePath.startsWith(contextDir)) {
-          return;
-        }
-      }
+      if (!isInScope(filePath)) return;
 
+      const wasNonExistent = nonExistentFiles.has(filePath);
       const originalContent = fileContentCache.get(filePath);
 
       // --- Determine new content ---
@@ -903,10 +934,12 @@ export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEdi
 
       // --- Revert file to pre-edit state ---
       try {
-        if (originalContent !== undefined) {
+        if (wasNonExistent) {
+          // Write created a new file — delete it so Zed's Review UI shows
+          // file creation pending accept/reject.
+          fs.unlinkSync(filePath);
+        } else if (originalContent !== undefined) {
           fs.writeFileSync(filePath, originalContent);
-        } else if (toolName === "Write" && !fs.existsSync(filePath)) {
-          // File didn't exist before Write created it — nothing to revert
         } else {
           // Uncached existing file — skip revert since we don't have the original
         }
@@ -931,6 +964,7 @@ export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEdi
 
       // --- Update cache for consecutive edits ---
       fileContentCache.set(filePath, newContent);
+      nonExistentFiles.delete(filePath);
     },
   };
 }
