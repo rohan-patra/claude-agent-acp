@@ -2528,7 +2528,12 @@ describe("usage_update computation", () => {
     const session = agent.sessions["test-session"];
     expect(session.contextWindowSize).toBe(200000);
 
-    await (agent as any).applyConfigOptionValue(session, "model", "claude-opus-4-6-1m");
+    await (agent as any).applyConfigOptionValue(
+      "test-session",
+      session,
+      "model",
+      "claude-opus-4-6-1m",
+    );
     expect(session.contextWindowSize).toBe(1000000);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2613,7 +2618,12 @@ describe("usage_update computation", () => {
     session.models = { ...session.models, currentModelId: "claude-opus-4-6-1m" };
 
     // User flips the selector to a 200k model.
-    await (agent as any).applyConfigOptionValue(session, "model", "claude-sonnet-4-6");
+    await (agent as any).applyConfigOptionValue(
+      "test-session",
+      session,
+      "model",
+      "claude-sonnet-4-6",
+    );
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
