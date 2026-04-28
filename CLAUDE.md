@@ -119,8 +119,7 @@ In addition to the FileEditInterceptor, this fork adds model-aware session confi
 **Modified areas in `src/acp-agent.ts`:**
 - `Session` type: added `fastModeState`, `effortLevel`, `modelInfos`, `contextDisplayView`, `contextDisplayState` fields
 - `buildConfigOptions()`: accepts optional `modelInfos`, `currentEffortLevel`, `fastModeState`, `contextDisplay` params; conditionally pushes `effort_level`, `fast_mode`, and (always) `context_display` options
-- `setSessionConfigOption()`: handles `fast_mode`, `effort_level`, and `context_display` config IDs; model handler rebuilds config options and re-derives `contextDisplayState.rawMax`
-- `syncSessionConfigState()`: handles `fast_mode` and `effort_level`
+- `applyConfigOptionValue()`: handles `fast_mode`, `effort_level`, and `context_display` config IDs (the if/else chain that `setSessionConfigOption()` and `updateConfigOption()` both call); model handler rebuilds config options and re-derives `contextDisplayState.rawMax`
 - `pushContextDisplayOption()`: private method — rebuilds the `context_display` option from current session state and fires `config_option_update`
 - `prompt()` result handler: syncs `fast_mode_state` from SDK result messages; updates `contextDisplayState` (and fetches `autoCompactThreshold` on first turn) then calls `pushContextDisplayOption()`
 - `prompt()` `compact_boundary` handler: resets `contextDisplayState.used = 0` and calls `pushContextDisplayOption()`
@@ -140,11 +139,11 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - PostToolUse `onFileRead` wiring (~3 lines in the `createPostToolUseHook` options)
    - PreToolUse hooks block calling `createPreToolUseHook` with `onPreWrite` (sibling to PostToolUse block)
    - `fileEditInterceptor` forwarding in `toAcpNotifications` and `streamEventToAcpNotifications`
-   - Session config improvements: `buildConfigOptions()` extended with model capability params, `setSessionConfigOption()` handles `fast_mode`/`effort_level`, `syncSessionConfigState()` extended, `prompt()` result handler syncs `fast_mode_state`
-   - `context_display` dropdown: import from `./context-display.js`, `Session` fields (`contextDisplayView`, `contextDisplayState`), `buildConfigOptions()` `contextDisplay` param, `pushContextDisplayOption()` method, `prompt()` result-handler state update + one-shot `getContextUsage()` fetch, `compact_boundary` reset, `setSessionConfigOption()` `context_display` branch, `setSessionConfigOption()` model branch re-derives `contextDisplayState.rawMax`
+   - Session config improvements: `buildConfigOptions()` extended with model capability params, `applyConfigOptionValue()` handles `fast_mode`/`effort_level`, `prompt()` result handler syncs `fast_mode_state`
+   - `context_display` dropdown: import from `./context-display.js`, `Session` fields (`contextDisplayView`, `contextDisplayState`), `buildConfigOptions()` `contextDisplay` param, `pushContextDisplayOption()` method, `prompt()` result-handler state update + one-shot `getContextUsage()` fetch, `compact_boundary` reset, `applyConfigOptionValue()` `context_display` branch, `applyConfigOptionValue()` model branch re-derives `contextDisplayState.rawMax`
    - `CLAUDE_CODE_THINKING_DISPLAY` env-var opt-in (~8 lines in `createSession()` near `maxThinkingTokens`): reads `process.env.CLAUDE_CODE_THINKING_DISPLAY` (`"summarized"` or `"omitted"`), spreads `thinking: { type: "adaptive", display }` into `Options` only when set. Opus 4.7 defaults `display` to `"omitted"`; this restores populated thinking streams when users opt in via Zed's `agent_servers.env`.
 
-   If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, or `setSessionConfigOption()`, our blocks need to stay in the same logical positions.
+   If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, `setSessionConfigOption()`, or `applyConfigOptionValue()`, our blocks need to stay in the same logical positions.
 
 2. **`src/tools.ts`** — Our changes are:
    - `fs` import addition at the top
