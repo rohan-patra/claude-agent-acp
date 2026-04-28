@@ -51,8 +51,11 @@ import {
   ModelUsage,
   Options,
   PermissionMode,
+  PermissionUpdate,
   Query,
   query,
+  Settings,
+  SDKAssistantMessageError,
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
@@ -135,6 +138,7 @@ type Session = {
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
   models: SessionModelState;
+  modelInfos: ModelInfo[];
   configOptions: SessionConfigOption[];
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
@@ -270,14 +274,53 @@ export type ToolUseCache = {
   };
 };
 
-function isStaticBinary(): boolean {
-  return process.env.CLAUDE_AGENT_ACP_IS_SINGLE_FILE_BUN !== undefined;
+export async function claudeCliPath(): Promise<string> {
+  if (process.env.CLAUDE_CODE_EXECUTABLE) {
+    return process.env.CLAUDE_CODE_EXECUTABLE;
+  }
+  // The SDK's CLI is a native binary shipped as a platform-specific optional
+  // dependency of @anthropic-ai/claude-agent-sdk. Resolve via a require bound
+  // to the SDK so nested installs are found even when npm doesn't hoist.
+  const { createRequire } = await import("node:module");
+  const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
+  const ext = process.platform === "win32" ? ".exe" : "";
+  // On linux, both glibc and musl variants may be installed side-by-side
+  // (e.g. bunx hydrates every optional dep), so picking one by trial is
+  // unreliable: the wrong binary segfaults at runtime instead of failing to
+  // spawn. Detect the runtime libc and prefer the matching variant, falling
+  // back to the other only if the preferred one isn't installed.
+  const candidates =
+    process.platform === "linux"
+      ? isMuslLibc()
+        ? [
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+          ]
+        : [
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
+          ]
+      : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
+  for (const candidate of candidates) {
+    try {
+      return req.resolve(candidate);
+    } catch {
+      // try next candidate
+    }
+  }
+  throw new Error(
+    `Claude native binary not found for ${process.platform}-${process.arch}. ` +
+      `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
+  );
 }
 
-export async function claudeCliPath(): Promise<string> {
-  return isStaticBinary()
-    ? (await import("@anthropic-ai/claude-agent-sdk/embed")).default
-    : import.meta.resolve("@anthropic-ai/claude-agent-sdk").replace("sdk.mjs", "cli.js");
+function isMuslLibc(): boolean {
+  // process.report.getReport().header.glibcVersionRuntime is populated when
+  // Node is dynamically linked against glibc, and absent on musl.
+  const report = process.report?.getReport() as
+    | { header?: { glibcVersionRuntime?: string } }
+    | undefined;
+  return !report?.header?.glibcVersionRuntime;
 }
 
 function shouldHideClaudeAuth(): boolean {
@@ -291,6 +334,56 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+
+// The Claude SDK persists local slash command invocations (e.g. `/model`) and
+// their output as user messages in the session transcript, wrapping the
+// payload in these XML-like markers that the CLI uses for its own display.
+// The live prompt loop drops them; replay must strip them too or they leak
+// into the UI on session/load.
+const LOCAL_COMMAND_TAG_PATTERN =
+  /<(command-name|command-message|command-args|local-command-stdout|local-command-stderr)>[\s\S]*?<\/\1>/g;
+
+function stripMarkerTags(text: string): string {
+  return text.replace(LOCAL_COMMAND_TAG_PATTERN, "");
+}
+
+/**
+ * Return user-message content with local-command marker tags removed, or
+ * `null` if nothing meaningful remains (caller should skip the message).
+ * Preserves real prose that's mixed in alongside the markers — e.g. a
+ * message like `<command-name>…</command-name>hi` becomes `hi`.
+ */
+export function stripLocalCommandMetadata(content: unknown): unknown | null {
+  if (typeof content === "string") {
+    const stripped = stripMarkerTags(content);
+    return stripped.trim() === "" ? null : stripped;
+  }
+  if (!Array.isArray(content)) return content;
+
+  const kept: unknown[] = [];
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      "type" in block &&
+      (block as { type: unknown }).type === "text" &&
+      "text" in block &&
+      typeof (block as { text: unknown }).text === "string"
+    ) {
+      const stripped = stripMarkerTags((block as { text: string }).text);
+      if (stripped.trim() === "") continue;
+      kept.push({ ...(block as object), text: stripped });
+    } else {
+      kept.push(block);
+    }
+  }
+  if (kept.length === 0) return null;
+  return kept;
+}
+
+export function isLocalCommandMetadata(content: unknown): boolean {
+  return stripLocalCommandMetadata(content) === null;
+}
 
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
@@ -328,6 +421,50 @@ export function resolvePermissionMode(defaultMode?: unknown): PermissionMode {
   }
 
   return mapped;
+}
+
+/**
+ * Builds the label for the "Always Allow" permission option so the user can see
+ * the exact scope they are committing to. Uses the SDK-provided suggestions
+ * when available (e.g. `Bash(npm test:*)`) and falls back to naming the whole
+ * tool so "Always Allow" is never a blank check without disclosure.
+ */
+export function describeAlwaysAllow(
+  suggestions: PermissionUpdate[] | undefined,
+  toolName: string,
+): string {
+  if (!suggestions || suggestions.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  const ruleLabels: string[] = [];
+  const directories: string[] = [];
+
+  for (const update of suggestions) {
+    if (update.type === "addRules" && update.behavior === "allow") {
+      for (const rule of update.rules) {
+        ruleLabels.push(
+          rule.ruleContent ? `${rule.toolName}(${rule.ruleContent})` : `all ${rule.toolName}`,
+        );
+      }
+    } else if (update.type === "addDirectories") {
+      directories.push(...update.directories);
+    }
+  }
+
+  const parts: string[] = [];
+  if (ruleLabels.length > 0) {
+    parts.push(ruleLabels.join(", "));
+  }
+  if (directories.length > 0) {
+    parts.push(`access to ${directories.join(", ")}`);
+  }
+
+  if (parts.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  return `Always Allow ${parts.join(" and ")}`;
 }
 
 // Implement the ACP Agent interface
@@ -512,7 +649,7 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
-  async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
     // Needs to happen after we return the session
@@ -578,6 +715,13 @@ export class ClaudeAcpAgent implements Agent {
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
+    // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
+    // problem, billing), it sets a categorical `error` field on the
+    // `SDKAssistantMessage` that precedes the final `result` message. We
+    // capture it here so the subsequent `RequestError.internalError` can
+    // forward it to clients as structured `data`, sparing them from
+    // pattern-matching on the human-readable message text.
+    let lastAssistantError: SDKAssistantMessageError | undefined;
 
     const userMessage = promptToClaude(params);
 
@@ -721,6 +865,7 @@ export class ClaudeAcpAgent implements Agent {
               case "memory_recall":
               case "notification":
               case "api_retry":
+              case "mirror_error":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -777,7 +922,10 @@ export class ClaudeAcpAgent implements Agent {
                   break;
                 }
                 if (message.is_error) {
-                  throw RequestError.internalError(undefined, message.result);
+                  throw RequestError.internalError(
+                    errorKindData(lastAssistantError),
+                    message.result,
+                  );
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
@@ -802,7 +950,7 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 if (message.is_error) {
                   throw RequestError.internalError(
-                    undefined,
+                    errorKindData(lastAssistantError),
                     message.errors.join(", ") || message.subtype,
                   );
                 }
@@ -814,7 +962,7 @@ export class ClaudeAcpAgent implements Agent {
               case "error_max_structured_output_retries":
                 if (message.is_error) {
                   throw RequestError.internalError(
-                    undefined,
+                    errorKindData(lastAssistantError),
                     message.errors.join(", ") || message.subtype,
                   );
                 }
@@ -929,6 +1077,9 @@ export class ClaudeAcpAgent implements Agent {
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
               if (message.message.model && message.message.model !== "<synthetic>") {
                 lastAssistantModel = message.message.model;
+              }
+              if (message.error) {
+                lastAssistantError = message.error;
               }
             }
 
@@ -1154,12 +1305,7 @@ export class ClaudeAcpAgent implements Agent {
       disallowedTools: ["*"],
       systemPrompt: { type: "preset", preset: "claude_code" },
       settingSources: ["user", "project", "local"],
-      executable: isStaticBinary() ? undefined : (process.execPath as any),
-      ...(process.env.CLAUDE_CODE_EXECUTABLE
-        ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
-        : isStaticBinary()
-          ? { pathToClaudeCodeExecutable: await claudeCliPath() }
-          : {}),
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
       ...(canResume ? { resume: params.sessionId } : {}),
     };
 
@@ -1255,7 +1401,7 @@ export class ClaudeAcpAgent implements Agent {
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
-  async unstable_closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
     }
@@ -1266,11 +1412,17 @@ export class ClaudeAcpAgent implements Agent {
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
-    await this.sessions[params.sessionId].query.setModel(params.modelId);
-    await this.updateConfigOption(params.sessionId, "model", params.modelId);
+    // Resolve aliases (e.g. "opus", "opus[1m]") to canonical model IDs so
+    // downstream lookups in modelInfos succeed and the effort option isn't
+    // silently dropped.
+    const resolved = resolveModelPreference(session.modelInfos, params.modelId);
+    const modelId = resolved?.value ?? params.modelId;
+    await session.query.setModel(modelId);
+    await this.updateConfigOption(params.sessionId, "model", modelId);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1340,14 +1492,11 @@ export class ClaudeAcpAgent implements Agent {
     } else if (params.configId === "model") {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
     }
+    // Effort SDK sync is handled inside applyConfigOptionValue so that direct
+    // effort changes and effort changes induced by a model switch go through
+    // the same path.
 
-    this.syncSessionConfigState(session, params.configId, params.value);
-
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === params.configId && typeof o.currentValue === "string"
-        ? { ...o, currentValue: resolvedValue }
-        : o,
-    );
+    await this.applyConfigOptionValue(session, params.configId, resolvedValue);
 
     return { configOptions: session.configOptions };
   }
@@ -1384,9 +1533,17 @@ export class ClaudeAcpAgent implements Agent {
     const messages = await getSessionMessages(sessionId);
 
     for (const message of messages) {
+      // @ts-expect-error - untyped in SDK but we handle all of these
+      let content: unknown = message.message.content;
+      // @ts-expect-error - untyped in SDK but we handle all of these
+      if (message.message.role === "user") {
+        content = stripLocalCommandMetadata(content);
+        if (content === null) continue;
+      }
+
       for (const notification of toAcpNotifications(
         // @ts-expect-error - untyped in SDK but we handle all of these
-        message.message.content,
+        content,
         // @ts-expect-error - untyped in SDK but we handle all of these
         message.message.role,
         sessionId,
@@ -1416,6 +1573,7 @@ export class ClaudeAcpAgent implements Agent {
 
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
+      const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
@@ -1506,7 +1664,7 @@ export class ClaudeAcpAgent implements Agent {
         options: [
           {
             kind: "allow_always",
-            name: "Always Allow",
+            name: alwaysAllowLabel,
             optionId: "allow_always",
           },
           { kind: "allow_once", name: "Allow", optionId: "allow" },
@@ -1579,11 +1737,7 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[sessionId];
     if (!session) return;
 
-    this.syncSessionConfigState(session, configId, value);
-
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
-    );
+    await this.applyConfigOptionValue(session, configId, value);
 
     await this.client.sessionUpdate({
       sessionId,
@@ -1594,7 +1748,12 @@ export class ClaudeAcpAgent implements Agent {
     });
   }
 
-  private syncSessionConfigState(session: Session, configId: string, value: string): void {
+  private async applyConfigOptionValue(
+    session: Session,
+    configId: string,
+    value: string,
+  ): Promise<void> {
+    // Sync top-level session state
     if (configId === "mode") {
       session.modes = { ...session.modes, currentModeId: value };
     } else if (configId === "model") {
@@ -1606,6 +1765,39 @@ export class ClaudeAcpAgent implements Agent {
         session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
+    }
+
+    // Update configOptions
+    if (configId === "model") {
+      // Rebuild config options since effort levels depend on the selected model
+      const effortOpt = session.configOptions.find((o) => o.id === "effort");
+      const currentEffort =
+        typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
+      session.configOptions = buildConfigOptions(
+        session.modes,
+        session.models,
+        session.modelInfos,
+        currentEffort,
+      );
+
+      // Sync effort with the SDK if it changed after the model switch
+      const newEffortOpt = session.configOptions.find((o) => o.id === "effort");
+      const newEffort =
+        typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
+      if (newEffort !== currentEffort) {
+        await session.query.applyFlagSettings({
+          effortLevel: newEffort as Settings["effortLevel"],
+        });
+      }
+    } else {
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
+      if (configId === "effort") {
+        await session.query.applyFlagSettings({
+          effortLevel: value as Settings["effortLevel"],
+        });
+      }
     }
   }
 
@@ -1707,10 +1899,16 @@ export class ClaudeAcpAgent implements Agent {
         systemPrompt = customPrompt;
       } else if (
         typeof customPrompt === "object" &&
-        "append" in customPrompt &&
-        typeof customPrompt.append === "string"
+        customPrompt !== null &&
+        !Array.isArray(customPrompt)
       ) {
-        systemPrompt.append = customPrompt.append;
+        // Forward all preset options (append, excludeDynamicSections, and
+        // anything the SDK adds later) while locking type/preset.
+        systemPrompt = {
+          ...(customPrompt as object),
+          type: "preset",
+          preset: "claude_code",
+        } as Options["systemPrompt"];
       }
     }
 
@@ -1726,6 +1924,9 @@ export class ClaudeAcpAgent implements Agent {
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
       : undefined;
+
+    // Parse model configuration from environment (e.g. Bedrock model overrides)
+    const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
@@ -1745,6 +1946,17 @@ export class ClaudeAcpAgent implements Agent {
       settingSources: ["user", "project", "local"],
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
+      // CLAUDE_MODEL_CONFIG env var is a fallback for model
+      // configuration (e.g. Bedrock model ID overrides). When the caller
+      // provides settings via _meta, we intentionally ignore the env var —
+      // the caller is assumed to have full control over model configuration.
+      ...(!userProvidedOptions?.settings &&
+        modelConfig && {
+          settings: {
+            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
+            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
+          },
+        }),
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
@@ -1761,14 +1973,7 @@ export class ClaudeAcpAgent implements Agent {
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
-      // note: although not documented by the types, passing an absolute path
-      // here works to find zed's managed node version.
-      executable: isStaticBinary() ? undefined : (process.execPath as any),
-      ...(process.env.CLAUDE_CODE_EXECUTABLE
-        ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
-        : isStaticBinary()
-          ? { pathToClaudeCodeExecutable: await claudeCliPath() }
-          : {}),
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",
@@ -1890,7 +2095,20 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
-    const configOptions = buildConfigOptions(modes, models);
+    const configOptions = buildConfigOptions(
+      modes,
+      models,
+      initializationResult.models,
+      settingsManager.getSettings().effortLevel,
+    );
+
+    // Apply the initial effort level to the SDK so it matches the UI default
+    const initialEffort = configOptions.find((o) => o.id === "effort");
+    if (initialEffort && typeof initialEffort.currentValue === "string") {
+      await q.applyFlagSettings({
+        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
+      });
+    }
 
     this.sessions[sessionId] = {
       query: q,
@@ -1907,6 +2125,7 @@ export class ClaudeAcpAgent implements Agent {
       },
       modes,
       models,
+      modelInfos: initializationResult.models,
       configOptions,
       promptRunning: false,
       pendingMessages: new Map(),
@@ -1966,6 +2185,22 @@ function totalTokens(usage: UsageSnapshot): number {
   );
 }
 
+/**
+ * Build the `data` payload attached to a `RequestError.internalError` when we
+ * have a categorical error from the Claude SDK. Returns `undefined` when no
+ * categorical error is available, matching the previous behavior of passing
+ * `undefined` to `RequestError.internalError`.
+ *
+ * The `errorKind` field is a convention for ACP clients to dispatch on
+ * without having to pattern-match the human-readable message text. Clients
+ * that don't understand it fall back to the existing message-based rendering.
+ */
+function errorKindData(
+  errorKind: SDKAssistantMessageError | undefined,
+): { errorKind: SDKAssistantMessageError } | undefined {
+  return errorKind ? { errorKind } : undefined;
+}
+
 /** Project a nullable API usage object into our non-null snapshot shape.
  *  Both SDK message_start and assistant message `usage` have `number | null`
  *  cache fields; we coerce absent values to 0 so `totalTokens` never hits
@@ -2004,8 +2239,10 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
+  modelInfos: ModelInfo[],
+  currentEffortLevel?: string,
 ): SessionConfigOption[] {
-  return [
+  const options: SessionConfigOption[] = [
     {
       id: "mode",
       name: "Mode",
@@ -2033,6 +2270,46 @@ function buildConfigOptions(
       })),
     },
   ];
+
+  // Add effort level option based on the currently selected model
+  const currentModelInfo = modelInfos.find((m) => m.value === models.currentModelId);
+  const supportedLevels = currentModelInfo?.supportsEffort
+    ? (currentModelInfo.supportedEffortLevels ?? [])
+    : [];
+
+  if (supportedLevels.length > 0) {
+    const effortOptions = supportedLevels.map((level) => ({
+      value: level,
+      name: level
+        .split(/[_-]/)
+        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+        .join(" "),
+    }));
+
+    // Keep the current level if valid, otherwise prefer xhigh (Claude Code's
+    // recommended default for capable models), then high (the API default).
+    const includes = (l: string) => (supportedLevels as string[]).includes(l);
+    const validEffort =
+      currentEffortLevel && includes(currentEffortLevel)
+        ? currentEffortLevel
+        : includes("xhigh")
+          ? "xhigh"
+          : includes("high")
+            ? "high"
+            : supportedLevels[0];
+
+    options.push({
+      id: "effort",
+      name: "Effort",
+      description: "Available effort levels for this model",
+      category: "effort",
+      type: "select",
+      currentValue: validEffort,
+      options: effortOptions,
+    });
+  }
+
+  return options;
 }
 
 // Claude Code CLI persists display strings like "opus[1m]" in settings,
@@ -2631,6 +2908,20 @@ function commonPrefixLength(a: string, b: string) {
 function inferContextWindowFromModel(model: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
   return null;
+}
+
+function parseModelConfig(
+  raw: string | undefined,
+): { modelOverrides?: Record<string, string>; availableModels?: string[] } | undefined {
+  if (!raw) return undefined;
+  const parsed = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("CLAUDE_MODEL_CONFIG must be a JSON object");
+  }
+  const result: { modelOverrides?: Record<string, string>; availableModels?: string[] } = {};
+  if (parsed.modelOverrides !== undefined) result.modelOverrides = parsed.modelOverrides;
+  if (parsed.availableModels !== undefined) result.availableModels = parsed.availableModels;
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentModel: string) {
