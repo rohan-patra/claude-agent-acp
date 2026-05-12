@@ -30,7 +30,7 @@ const MOCK_MODELS = {
   currentModelId: "claude-opus-4-5",
   availableModels: [
     { modelId: "claude-opus-4-5", name: "Claude Opus", description: "Most capable" },
-    { modelId: "claude-sonnet-4-5", name: "Claude Sonnet", description: "Balanced" },
+    { modelId: "claude-sonnet-4-6", name: "Claude Sonnet", description: "Balanced" },
     {
       modelId: "claude-opus-4-5-1m",
       name: "Claude Opus (1M)",
@@ -250,10 +250,10 @@ describe("session config options", () => {
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
-      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
 
       const configUpdate = sessionUpdates.find(
         (n) => n.update.sessionUpdate === "config_option_update",
@@ -315,7 +315,7 @@ describe("session config options", () => {
         value: "sonnet",
       });
 
-      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
     });
 
     it("resolves display name to model ID", async () => {
@@ -325,19 +325,19 @@ describe("session config options", () => {
         value: "Claude Sonnet",
       });
 
-      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
     });
 
     it("still works with exact model ID", async () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
-      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
       const modelOption = response.configOptions.find((o) => o.id === "model");
-      expect(modelOption?.currentValue).toBe("claude-sonnet-4-5");
+      expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
     });
 
     it("throws for completely invalid model value", async () => {
@@ -523,7 +523,7 @@ describe("session config options", () => {
     it("sends config_option_update when model is changed via setSessionModel", async () => {
       await agent.unstable_setSessionModel({
         sessionId: SESSION_ID,
-        modelId: "claude-sonnet-4-5",
+        modelId: "claude-sonnet-4-6",
       });
 
       const configUpdate = sessionUpdates.find(
@@ -533,7 +533,7 @@ describe("session config options", () => {
       expect(configUpdate?.update).toMatchObject({
         sessionUpdate: "config_option_update",
         configOptions: expect.arrayContaining([
-          expect.objectContaining({ id: "model", currentValue: "claude-sonnet-4-5" }),
+          expect.objectContaining({ id: "model", currentValue: "claude-sonnet-4-6" }),
         ]),
       });
     });
@@ -541,7 +541,7 @@ describe("session config options", () => {
     it("updates stored configOptions currentValue when model changes", async () => {
       await agent.unstable_setSessionModel({
         sessionId: SESSION_ID,
-        modelId: "claude-sonnet-4-5",
+        modelId: "claude-sonnet-4-6",
       });
 
       const session = (
@@ -550,7 +550,7 @@ describe("session config options", () => {
         }
       ).sessions[SESSION_ID];
       const modelOption = session.configOptions.find((o) => o.id === "model");
-      expect(modelOption?.currentValue).toBe("claude-sonnet-4-5");
+      expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
     });
 
     it("includes updated effort in config_option_update when model drops effort support", async () => {
@@ -564,7 +564,7 @@ describe("session config options", () => {
           supportedEffortLevels: ["low", "medium", "high"],
         },
         {
-          value: "claude-sonnet-4-5",
+          value: "claude-sonnet-4-6",
           displayName: "Claude Sonnet",
           description: "Balanced",
           supportsEffort: false,
@@ -573,7 +573,7 @@ describe("session config options", () => {
 
       await agent.unstable_setSessionModel({
         sessionId: SESSION_ID,
-        modelId: "claude-sonnet-4-5",
+        modelId: "claude-sonnet-4-6",
       });
 
       const configUpdate = sessionUpdates.find(
@@ -602,7 +602,7 @@ describe("session config options", () => {
           supportedEffortLevels: ["low", "medium", "high", "max"],
         },
         {
-          value: "claude-sonnet-4-5",
+          value: "claude-sonnet-4-6",
           displayName: "Claude Sonnet",
           description: "Balanced",
           supportsEffort: true,
@@ -612,7 +612,7 @@ describe("session config options", () => {
 
       await agent.unstable_setSessionModel({
         sessionId: SESSION_ID,
-        modelId: "claude-sonnet-4-5",
+        modelId: "claude-sonnet-4-6",
       });
 
       const configUpdate = sessionUpdates.find(
@@ -634,7 +634,7 @@ describe("session config options", () => {
 
       await agent.unstable_setSessionModel({
         sessionId: SESSION_ID,
-        modelId: "claude-sonnet-4-5",
+        modelId: "claude-sonnet-4-6",
       });
 
       const configUpdate = sessionUpdates.find(
@@ -671,7 +671,7 @@ describe("session config options", () => {
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
       const configUpdates = sessionUpdates.filter(
@@ -761,7 +761,7 @@ describe("session config options", () => {
           supportedEffortLevels: ["low", "medium", "high"],
         },
         {
-          value: "claude-sonnet-4-5",
+          value: "claude-sonnet-4-6",
           displayName: "Claude Sonnet",
           description: "Balanced",
           supportsEffort: false,
@@ -771,7 +771,7 @@ describe("session config options", () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
       const effortOption = response.configOptions.find((o) => o.id === "effort");
@@ -789,7 +789,7 @@ describe("session config options", () => {
           supportedEffortLevels: ["low", "medium", "high"],
         },
         {
-          value: "claude-sonnet-4-5",
+          value: "claude-sonnet-4-6",
           displayName: "Claude Sonnet",
           description: "Balanced",
           supportsEffort: false,
@@ -799,7 +799,7 @@ describe("session config options", () => {
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
       expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: undefined });
@@ -808,7 +808,7 @@ describe("session config options", () => {
     it("adds effort option when switching to a model that supports effort", async () => {
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
       // Start with sonnet (no effort) as current
-      session.models = { ...session.models, currentModelId: "claude-sonnet-4-5" };
+      session.models = { ...session.models, currentModelId: "claude-sonnet-4-6" };
       session.modelInfos = [
         {
           value: "claude-opus-4-5",
@@ -818,7 +818,7 @@ describe("session config options", () => {
           supportedEffortLevels: ["low", "medium", "high"],
         },
         {
-          value: "claude-sonnet-4-5",
+          value: "claude-sonnet-4-6",
           displayName: "Claude Sonnet",
           description: "Balanced",
           supportsEffort: false,
@@ -854,7 +854,7 @@ describe("session config options", () => {
           supportedEffortLevels: ["low", "medium", "high", "max"],
         },
         {
-          value: "claude-sonnet-4-5",
+          value: "claude-sonnet-4-6",
           displayName: "Claude Sonnet",
           description: "Balanced",
           supportsEffort: true,
@@ -865,7 +865,7 @@ describe("session config options", () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
       const effortOption = response.configOptions.find((o) => o.id === "effort");
@@ -888,7 +888,7 @@ describe("session config options", () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
       const effortOption = response.configOptions.find((o) => o.id === "effort");
@@ -917,10 +917,10 @@ describe("session config options", () => {
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
-        value: "claude-sonnet-4-5",
+        value: "claude-sonnet-4-6",
       });
 
-      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
     });
 
     it("setSessionMode also syncs configOptions", async () => {
@@ -937,7 +937,7 @@ describe("session config options", () => {
     it("setSessionModel also syncs configOptions", async () => {
       await agent.unstable_setSessionModel({
         sessionId: SESSION_ID,
-        modelId: "claude-sonnet-4-5",
+        modelId: "claude-sonnet-4-6",
       });
 
       const session = (
@@ -946,7 +946,7 @@ describe("session config options", () => {
         }
       ).sessions[SESSION_ID];
       expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
-        "claude-sonnet-4-5",
+        "claude-sonnet-4-6",
       );
     });
   });
@@ -971,7 +971,7 @@ describe("session config options", () => {
           supportsAutoMode: true,
         },
         {
-          value: "claude-sonnet-4-5",
+          value: "claude-sonnet-4-6",
           displayName: "Claude Sonnet",
           description: "Balanced",
           supportsEffort: true,
@@ -991,7 +991,7 @@ describe("session config options", () => {
         currentModelId: "claude-opus-4-5",
         availableModels: [
           { modelId: "claude-opus-4-5", name: "Claude Opus", description: "Most capable" },
-          { modelId: "claude-sonnet-4-5", name: "Claude Sonnet", description: "Balanced" },
+          { modelId: "claude-sonnet-4-6", name: "Claude Sonnet", description: "Balanced" },
           { modelId: "claude-haiku-4-5", name: "Claude Haiku", description: "Fast" },
         ],
       };

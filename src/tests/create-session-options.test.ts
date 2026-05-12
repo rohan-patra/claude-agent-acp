@@ -15,10 +15,16 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       return {
         initializationResult: async () => ({
           models: [
-            { value: "claude-sonnet-4-5", displayName: "Claude Sonnet", description: "Fast" },
+            {
+              value: "claude-sonnet-4-6",
+              displayName: "Claude Sonnet",
+              description: "Fast",
+              supportsAutoMode: true,
+            },
           ],
         }),
         setModel: async () => {},
+        setPermissionMode: async () => {},
         supportedCommands: async () => [],
         [Symbol.asyncIterator]: async function* () {},
       };
@@ -420,7 +426,7 @@ describe("createSession options merging", () => {
           claudeCode: {
             options: {
               settings: {
-                model: "claude-sonnet-4-5",
+                model: "claude-sonnet-4-6",
                 modelOverrides: { "claude-opus-4-6": "meta-value" },
               },
             },
@@ -432,7 +438,7 @@ describe("createSession options merging", () => {
       // plansDirectory is always injected unless caller passes settings as a string path.
       expect(capturedOptions!.settings).toEqual({
         plansDirectory: ".context/plans",
-        model: "claude-sonnet-4-5",
+        model: "claude-sonnet-4-6",
         modelOverrides: { "claude-opus-4-6": "meta-value" },
       });
     });
