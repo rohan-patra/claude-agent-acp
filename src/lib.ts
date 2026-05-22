@@ -10,14 +10,7 @@ export {
   type NewSessionMeta,
   type SDKMessageFilter,
 } from "./acp-agent.js";
-export {
-  loadManagedSettings,
-  applyEnvironmentSettings,
-  nodeToWebReadable,
-  nodeToWebWritable,
-  Pushable,
-  unreachable,
-} from "./utils.js";
+export { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 export {
   toolInfoFromToolUse,
   toDisplayPath,
@@ -26,11 +19,7 @@ export {
   createFileEditInterceptor,
   type FileEditInterceptor,
 } from "./tools.js";
-export {
-  SettingsManager,
-  type ClaudeCodeSettings,
-  type SettingsManagerOptions,
-} from "./settings.js";
+export { SettingsManager, type SettingsManagerOptions } from "./settings.js";
 
 // Export types
 export type { ClaudePlanEntry } from "./tools.js";
