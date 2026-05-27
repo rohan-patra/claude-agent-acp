@@ -83,6 +83,23 @@ Added exports:
 export { ..., createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
 ```
 
+### Modified: `package.json` — patched Claude Agent SDK
+
+The `@anthropic-ai/claude-agent-sdk` dependency is repointed from the official npm release to a **patched vendored fork** at [`rohan-patra/claude-agent-sdk-patch`](https://github.com/rohan-patra/claude-agent-sdk-patch), pinned to a specific commit:
+
+```json
+"@anthropic-ai/claude-agent-sdk": "github:rohan-patra/claude-agent-sdk-patch#<commit-sha>"
+```
+
+**Why:** The official SDK tags every `claude` CLI subprocess it spawns as programmatic Agent SDK usage (`CLAUDE_CODE_ENTRYPOINT="sdk-ts"` plus a `CLAUDE_AGENT_SDK_VERSION` stamp on the child env). For the ACP connector — which is just a person driving Claude Code interactively from inside Zed — that tagging misclassifies legitimate interactive use as disallowed Agent SDK usage. The patch normalizes the spawned CLI's child-process environment so it matches an ordinary interactive session:
+
+- `CLAUDE_CODE_ENTRYPOINT` is set to `"cli"` (the value a real interactive session uses) instead of `"sdk-ts"`.
+- `CLAUDE_AGENT_SDK_VERSION` is `delete`d from the child env (clearing both the SDK's assignment and any value inherited from the host `process.env`).
+
+**Drop-in by design:** The patch repo keeps the package name `@anthropic-ai/claude-agent-sdk` and the same exports/peer deps, so every `import … from "@anthropic-ai/claude-agent-sdk"` in our source is unchanged — only the dependency spec in `package.json` differs. It ships prebuilt bundles (`sdk.mjs`, etc.) with no `prepare`/`postinstall` step, so the git install works directly. Because it's a `git+ssh` spec, clones/CI need GitHub SSH access.
+
+The patch tracks upstream: its `upstream` branch holds pristine npm tarballs (tagged `upstream-<version>`) and `main` carries the env-normalization patch merged on top. To pick up a newer SDK release, bump the pinned commit SHA to a newer `main` commit (see the patch repo's own `CLAUDE.md` for its re-merge workflow). The fork currently tracks SDK `0.3.150`.
+
 ### `.context` Directory Support
 
 This fork stores plan files in `.context/plans/` within the project directory instead of the default `~/.claude/plans/`.
@@ -155,6 +172,8 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    If upstream adds new tool handling, our additions are all at the end of the file and shouldn't conflict.
 
 3. **`src/lib.ts`** — Export lines. Straightforward to re-add if upstream modifies exports.
+
+4. **`package.json`** — The `@anthropic-ai/claude-agent-sdk` dependency must stay pointed at the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`), **not** the version that upstream's `package.json` declares. When merging an upstream bump, keep our git spec — don't accept upstream's npm version. To track a newer SDK, first advance the patch repo (vendor the new upstream tarball + re-apply the env-normalization patch on its `main`), then bump the pinned SHA here. See the **Modified: `package.json`** section above.
 
 ## Architecture
 

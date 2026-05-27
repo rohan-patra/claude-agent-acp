@@ -119,6 +119,14 @@ Plan files and other context artifacts are stored in `.context/` within the proj
 - **Effort level selector** — When the model supports it, a "thought level" config option appears in the session config.
 - **Fast mode toggle** — When the model supports it, an Off/Fast toggle appears. Server-side transitions (e.g., cooldown) are synced back to the UI.
 
+### Patched Claude Agent SDK
+
+This fork depends on a [patched build of the Claude Agent SDK](https://github.com/rohan-patra/claude-agent-sdk-patch) rather than the official npm package (it keeps the same `@anthropic-ai/claude-agent-sdk` name, so it's a drop-in replacement).
+
+The official SDK tags every `claude` CLI subprocess it spawns as programmatic Agent SDK usage (via `CLAUDE_CODE_ENTRYPOINT="sdk-ts"` and a `CLAUDE_AGENT_SDK_VERSION` stamp). But the ACP connector is just a person driving Claude Code interactively from inside Zed — so that tagging misclassifies legitimate interactive use as disallowed Agent SDK usage. The patch normalizes the spawned CLI's environment to match an ordinary interactive session (`CLAUDE_CODE_ENTRYPOINT="cli"`, with the SDK-version stamp cleared), so the connector is treated as the legitimate Claude Code use case it is.
+
+See [CLAUDE.md](./CLAUDE.md) for details on the patch and how to track newer SDK releases.
+
 ### All Upstream Features
 
 Everything else works unchanged:
@@ -147,7 +155,7 @@ This fork is designed for easy merges. All changes are additive:
 | `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, session config options for effort/fast mode, `.context` git-exclude on session creation, `plansDirectory` setting | All changes are purely additive insertion blocks |
 | `src/tools.ts` | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook`, `.context/` bypass in interceptor | Additions at end of file; shouldn't conflict |
 | `src/lib.ts` | 2 export lines (`createFileEditInterceptor`, `FileEditInterceptor` type) | Re-add if upstream changes exports |
-| `package.json` | No changes | — |
+| `package.json` | `@anthropic-ai/claude-agent-sdk` repointed to the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`) | Keep our git spec on merge — don't accept upstream's npm version; bump the SHA to track a newer SDK |
 
 See [CLAUDE.md](./CLAUDE.md) for detailed merge instructions and architecture documentation.
 
