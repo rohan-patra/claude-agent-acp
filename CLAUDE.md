@@ -98,7 +98,29 @@ The `@anthropic-ai/claude-agent-sdk` dependency is repointed from the official n
 
 **Drop-in by design:** The patch repo keeps the package name `@anthropic-ai/claude-agent-sdk` and the same exports/peer deps, so every `import … from "@anthropic-ai/claude-agent-sdk"` in our source is unchanged — only the dependency spec in `package.json` differs. It ships prebuilt bundles (`sdk.mjs`, etc.) with no `prepare`/`postinstall` step, so the git install works directly. Because it's a `git+ssh` spec, clones/CI need GitHub SSH access.
 
-The patch tracks upstream: its `upstream` branch holds pristine npm tarballs (tagged `upstream-<version>`) and `main` carries the env-normalization patch merged on top. To pick up a newer SDK release, bump the pinned commit SHA to a newer `main` commit (see the patch repo's own `CLAUDE.md` for its re-merge workflow). The fork currently tracks SDK `0.3.150`.
+The patch tracks upstream: its `upstream` branch holds pristine npm tarballs (tagged `upstream-<version>`) and `main` carries the env-normalization patch merged on top. To pick up a newer SDK release, bump the pinned commit SHA to a newer `main` commit (see the patch repo's own `CLAUDE.md` for its re-merge workflow). The fork currently tracks SDK `0.3.154`.
+
+**Checking for available patch-repo updates (use when an upstream merge bumps the SDK):**
+
+```bash
+# Currently-pinned SHA in our package.json:
+grep claude-agent-sdk-patch package.json
+
+# Recent patch-repo commits on main (look for "vendor: @anthropic-ai/claude-agent-sdk@<version>"):
+gh api repos/rohan-patra/claude-agent-sdk-patch/commits -q '.[] | .sha + " " + (.commit.message | split("\n")[0])' | head -10
+```
+
+If the patch repo already has a `vendor:` commit matching (or newer than) the SDK version upstream just bumped to, take the latest `main` SHA. If not, you must advance the patch repo first (per its own `CLAUDE.md`) before bumping here — otherwise the connector will be running an older SDK than upstream's code targets, and any new SDK-API uses in upstream's merge will fail at runtime.
+
+**SDK-bump merge procedure (when upstream's `package.json` shows a new `@anthropic-ai/claude-agent-sdk` version):**
+
+1. Find the corresponding patch-repo `main` SHA that vendors that SDK version (see commands above).
+2. Run `git merge upstream/main`. Expect conflicts in at least `package.json` and `package-lock.json`.
+3. In `package.json`, drop both conflict sides for the `@anthropic-ai/claude-agent-sdk` line and replace with our git spec pinned to the SHA from step 1. Keep upstream's other dep bumps.
+4. For `package-lock.json`, the fastest clean resolution is `git checkout --theirs package-lock.json && npm install` — that takes upstream's lockfile, then `npm install` regenerates the `@anthropic-ai/claude-agent-sdk` entry to point at our git spec while leaving every other dep at upstream's resolved versions.
+5. Resolve any `src/` conflicts (see below), then `git add` everything and commit.
+
+**Source-file merge gotcha:** Upstream occasionally reorganizes code adjacent to our additions. Recent example (v0.38.0): upstream moved the "Compacting completed." session-update text emission from the `compact_boundary` case to the `status` case (keyed on `compact_result === "success"`). Our fork had also added it in `compact_boundary` for our `contextDisplayState` reset path, so we ended up with a textual conflict. Resolution: keep our fork-specific addition (the `contextDisplayState` reset + `pushContextDisplayOption` call) but drop the duplicate text emission since upstream now handles that in `status`. The general rule: when a conflict hunk shows upstream removing a line that our fork also added nearby, check whether upstream just relocated it — if so, drop our copy.
 
 ### `.context` Directory Support
 
@@ -173,7 +195,7 @@ When pulling changes from `zed-industries/claude-agent-acp`:
 
 3. **`src/lib.ts`** — Export lines. Straightforward to re-add if upstream modifies exports.
 
-4. **`package.json`** — The `@anthropic-ai/claude-agent-sdk` dependency must stay pointed at the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`), **not** the version that upstream's `package.json` declares. When merging an upstream bump, keep our git spec — don't accept upstream's npm version. To track a newer SDK, first advance the patch repo (vendor the new upstream tarball + re-apply the env-normalization patch on its `main`), then bump the pinned SHA here. See the **Modified: `package.json`** section above.
+4. **`package.json` and `package-lock.json`** — The `@anthropic-ai/claude-agent-sdk` dependency must stay pointed at the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`), **not** the version that upstream's `package.json` declares. When merging an upstream bump, keep our git spec — don't accept upstream's npm version. To track a newer SDK, first advance the patch repo (vendor the new upstream tarball + re-apply the env-normalization patch on its `main`), then bump the pinned SHA here. See the **Modified: `package.json`** section above for the full step-by-step (including the `git checkout --theirs package-lock.json && npm install` shortcut for resolving the lockfile conflict).
 
 ## Architecture
 

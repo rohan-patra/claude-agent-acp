@@ -155,7 +155,7 @@ This fork is designed for easy merges. All changes are additive:
 | `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, session config options for effort/fast mode, `.context` git-exclude on session creation, `plansDirectory` setting | All changes are purely additive insertion blocks |
 | `src/tools.ts` | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook`, `.context/` bypass in interceptor | Additions at end of file; shouldn't conflict |
 | `src/lib.ts` | 2 export lines (`createFileEditInterceptor`, `FileEditInterceptor` type) | Re-add if upstream changes exports |
-| `package.json` | `@anthropic-ai/claude-agent-sdk` repointed to the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`) | Keep our git spec on merge — don't accept upstream's npm version; bump the SHA to track a newer SDK |
+| `package.json` | `@anthropic-ai/claude-agent-sdk` repointed to the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`) | Keep our git spec on merge — don't accept upstream's npm version; bump the SHA to track a newer SDK. For lockfile conflicts on an SDK bump, `git checkout --theirs package-lock.json && npm install` resolves cleanly. See [CLAUDE.md](./CLAUDE.md) for the full SDK-bump procedure. |
 
 See [CLAUDE.md](./CLAUDE.md) for detailed merge instructions and architecture documentation.
 
