@@ -357,10 +357,6 @@ function isMuslLibc(): boolean {
   return !report?.header?.glibcVersionRuntime;
 }
 
-function shouldHideClaudeAuth(): boolean {
-  return process.argv.includes("--hide-claude-auth");
-}
-
 // Bypass Permissions doesn't work if we are a root/sudo user
 const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
 const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
@@ -591,7 +587,7 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
 
-      if (!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)) {
+      if (supportsTerminalAuth || supportsMetaTerminalAuth) {
         terminalAuthMethods.push(remoteLoginMethod);
       }
     } else {
@@ -629,10 +625,8 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
 
-      if (!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)) {
-        terminalAuthMethods.push(claudeLoginMethod);
-      }
       if (supportsTerminalAuth || supportsMetaTerminalAuth) {
+        terminalAuthMethods.push(claudeLoginMethod);
         terminalAuthMethods.push(consoleLoginMethod);
       }
     }
@@ -780,6 +774,13 @@ export class ClaudeAcpAgent implements Agent {
     // forward it to clients as structured `data`, sparing them from
     // pattern-matching on the human-readable message text.
     let lastAssistantError: SDKAssistantMessageError | undefined;
+    // Tracks whether we're inside a compaction. The SDK emits the terminal
+    // `status` (compact_result success/failed) twice for a single failed
+    // compaction, and the two messages are indistinguishable — so we report the
+    // outcome only while a compaction is in progress, then clear this. A fresh
+    // `compacting` status sets it again, so every distinct compaction (e.g.
+    // repeated auto-compactions in a long turn) is still shown.
+    let compactionInProgress = false;
 
     const userMessage = promptToClaude(params);
 
@@ -854,11 +855,34 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               case "status": {
                 if (message.status === "compacting") {
+                  compactionInProgress = true;
                   await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
                       content: { type: "text", text: "Compacting..." },
+                    },
+                  });
+                } else if (message.compact_result === "success" && compactionInProgress) {
+                  // The SDK signals manual `/compact` completion with a status
+                  // message carrying `compact_result`, not the `compact_boundary`
+                  // message (which only fires when there's content to compact).
+                  compactionInProgress = false;
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: "\n\nCompacting completed." },
+                    },
+                  });
+                } else if (message.compact_result === "failed" && compactionInProgress) {
+                  compactionInProgress = false;
+                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
                     },
                   });
                 }
@@ -876,6 +900,10 @@ export class ClaudeAcpAgent implements Agent {
                 // The alternative (no update) leaves the client showing e.g.
                 // "944k/1m" right after the user sees "Compacting completed",
                 // which is confusing and wrong.
+                //
+                // The "Compacting completed." text is emitted from the `status`
+                // handler (keyed on `compact_result`), not here, so the failure
+                // path gets a message too.
                 lastAssistantTotalUsage = 0;
                 lastAssistantUsage = null;
                 await this.client.sessionUpdate({
@@ -892,13 +920,6 @@ export class ClaudeAcpAgent implements Agent {
                   rawMax: session.contextWindowSize,
                 };
                 await this.pushContextDisplayOption(message.session_id);
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: "\n\nCompacting completed." },
-                  },
-                });
                 break;
               }
               case "local_command_output": {
@@ -974,6 +995,7 @@ export class ClaudeAcpAgent implements Agent {
               case "api_retry":
               case "mirror_error":
               case "permission_denied":
+              case "thinking_tokens":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -1264,6 +1286,7 @@ export class ClaudeAcpAgent implements Agent {
             // payloads (e.g. /compact's malformed output) strip to null and are
             // skipped. Mirrors the replay path at replaySessionHistory.
             if (
+              message.message.role !== "system" &&
               typeof message.message.content === "string" &&
               message.message.content.includes("<local-command-stdout>")
             ) {
@@ -1306,6 +1329,9 @@ export class ClaudeAcpAgent implements Agent {
                   message.message.content.length === 1 &&
                   message.message.content[0].type === "text"))
             ) {
+              break;
+            }
+            if (message.message.role === "system") {
               break;
             }
 
@@ -2513,17 +2539,6 @@ export class ClaudeAcpAgent implements Agent {
       throw error;
     }
 
-    if (
-      shouldHideClaudeAuth() &&
-      initializationResult.account.subscriptionType &&
-      !this.gatewayAuthRequest
-    ) {
-      throw RequestError.authRequired(
-        undefined,
-        "This integration does not support using claude.ai subscriptions.",
-      );
-    }
-
     // Apply user's `availableModels` allowlist from settings.json before any
     // downstream model handling. The SDK only enforces this allowlist in its
     // own UI, not in `initializationResult.models`, so we filter here to keep
@@ -3604,6 +3619,7 @@ export function toAcpNotifications(
       case "compaction":
       case "compaction_delta":
       case "advisor_tool_result":
+      case "mid_conv_system":
         break;
 
       default:

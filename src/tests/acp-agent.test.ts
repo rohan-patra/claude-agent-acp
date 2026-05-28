@@ -240,13 +240,15 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       name: "compact",
     });
 
-    // Send something
-    await connection.prompt({
-      prompt: [{ type: "text", text: "Hi" }],
-      sessionId: newSessionResponse.sessionId,
-    });
-    // Clear response
-    client.takeReceivedText();
+    // Build up enough conversation that there's something to compact. The SDK
+    // refuses to compact a conversation with too few message groups.
+    for (let i = 0; i < 6; i++) {
+      await connection.prompt({
+        prompt: [{ type: "text", text: `Reply with just the number ${i}.` }],
+        sessionId: newSessionResponse.sessionId,
+      });
+      client.takeReceivedText();
+    }
 
     await connection.prompt({
       prompt: [
@@ -259,7 +261,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     });
 
     expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
-  }, 30000);
+  }, 60000);
 });
 
 describe("tool conversions", () => {
@@ -664,6 +666,7 @@ describe("tool conversions", () => {
           server_tool_use: null,
           inference_geo: null,
           iterations: null,
+          output_tokens_details: null,
           speed: null,
         },
         context_management: null,
