@@ -221,11 +221,12 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    // Bad model is ignored at the usage site; falls back to the first SDK model.
+    // Bad model is ignored at the usage site; with no allowlist the picker is
+    // the fork's model list, so it falls back to its first entry (Opus 4.8 1M).
     // No setModel call is needed because no override was applied — the SDK is
-    // already on its own default.
+    // already on its own default (also Opus 4.8 1M).
     expect(setModelSpy).not.toHaveBeenCalled();
-    expect(response.models.currentModelId).toBe("claude-sonnet-4-6");
+    expect(response.models.currentModelId).toBe("opus[1m]");
   });
 
   describe("auto mode availability per model", () => {
@@ -254,12 +255,19 @@ describe("ClaudeAcpAgent settings", () => {
     }
 
     it("omits `auto` from availableModes when the resolved model lacks supportsAutoMode", async () => {
+      // Pin Haiku — the only fork picker entry without `supportsAutoMode` (its
+      // capability flags are donated from the SDK's Haiku template below).
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ model: "haiku" }),
+      );
+
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
 
       mockQueryWithModels([
         {
-          value: "claude-haiku-4-5",
+          value: "haiku",
           displayName: "Claude Haiku",
           description: "Fast",
           // supportsAutoMode intentionally omitted
@@ -311,7 +319,9 @@ describe("ClaudeAcpAgent settings", () => {
     it("clamps permissions.defaultMode='auto' to 'default' on a model that lacks supportsAutoMode", async () => {
       await fs.promises.writeFile(
         path.join(tempDir, "settings.json"),
-        JSON.stringify({ permissions: { defaultMode: "auto" } }),
+        // Pin Haiku (no `supportsAutoMode`) so the resolved model can't honor
+        // `auto` and the clamp path runs.
+        JSON.stringify({ permissions: { defaultMode: "auto" }, model: "haiku" }),
       );
 
       const projectDir = path.join(tempDir, "project");
@@ -319,7 +329,7 @@ describe("ClaudeAcpAgent settings", () => {
 
       const { getCapturedOptions, setPermissionModeSpy } = mockQueryWithModels([
         {
-          value: "claude-haiku-4-5",
+          value: "haiku",
           displayName: "Claude Haiku",
           description: "Fast",
           // supportsAutoMode intentionally omitted
@@ -348,9 +358,7 @@ describe("ClaudeAcpAgent settings", () => {
 
         // A descriptive warning was logged so operators see the clamp.
         const messages = errorSpy.mock.calls.map((c) => c.join(" "));
-        expect(messages.some((m) => m.includes("auto") && m.includes("claude-haiku-4-5"))).toBe(
-          true,
-        );
+        expect(messages.some((m) => m.includes("auto") && m.includes("haiku"))).toBe(true);
       } finally {
         errorSpy.mockRestore();
       }
@@ -525,7 +533,10 @@ describe("ClaudeAcpAgent settings", () => {
       expect(modelOption.options.map((o: any) => o.value)).toEqual(["default"]);
     });
 
-    it("does not filter when availableModels is absent from settings", async () => {
+    it("surfaces the fork's full model picker when availableModels is absent", async () => {
+      // With no allowlist the SDK's curated list is replaced by the fork's
+      // explicit Claude Code picker (see `buildForkModelList`), regardless of
+      // what the SDK surfaced.
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
 
@@ -544,7 +555,15 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
-      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default", "haiku"]);
+      expect(modelOption.options.map((o: any) => o.value)).toEqual([
+        "opus[1m]",
+        "opus",
+        "claude-opus-4-7[1m]",
+        "claude-opus-4-7",
+        "claude-opus-4-6[1m]",
+        "sonnet",
+        "haiku",
+      ]);
     });
 
     it("passes the user's exact ID to setModel when it matches an SDK alias", async () => {
@@ -686,8 +705,10 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
-    expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+    // `opus[1m]` matches the fork picker entry verbatim; since the SDK's real
+    // list never surfaced it, we sync the pin via setModel.
+    expect(setModelSpy).toHaveBeenCalledWith("opus[1m]");
+    expect(response.models.currentModelId).toBe("opus[1m]");
   });
 
   it("skips the initial setModel when the resolved value matches the SDK's model list verbatim", async () => {
@@ -696,7 +717,9 @@ describe("ClaudeAcpAgent settings", () => {
     // setModel call would be a redundant round-trip (and on some launcher
     // setups, more fragile than launch-time selection).
     const originalEnv = process.env.ANTHROPIC_MODEL;
-    process.env.ANTHROPIC_MODEL = "claude-opus-4-6";
+    // `claude-opus-4-7` is a verbatim entry in the fork picker, and the SDK
+    // mock below also surfaces it, so the skip-setModel optimization applies.
+    process.env.ANTHROPIC_MODEL = "claude-opus-4-7";
 
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });
@@ -708,7 +731,7 @@ describe("ClaudeAcpAgent settings", () => {
           models: [
             { value: "default", displayName: "Default", description: "" },
             { value: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", description: "" },
-            { value: "claude-opus-4-6", displayName: "Claude Opus 4.6", description: "" },
+            { value: "claude-opus-4-7", displayName: "Claude Opus 4.7", description: "" },
           ],
         }),
         setModel: setModelSpy,
@@ -727,7 +750,7 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       expect(setModelSpy).not.toHaveBeenCalled();
-      expect(response.models.currentModelId).toBe("claude-opus-4-6");
+      expect(response.models.currentModelId).toBe("claude-opus-4-7");
     } finally {
       if (originalEnv === undefined) {
         delete process.env.ANTHROPIC_MODEL;

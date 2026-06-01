@@ -166,6 +166,22 @@ In addition to the FileEditInterceptor, this fork adds model-aware session confi
 
 **New file:** `src/context-display.ts` — pure formatters (`formatPercent`, `formatNumeric`, `formatUntilCompact`, `formatTokens`) and the `buildContextDisplayOption()` option builder. Covered by `src/tests/context-display.test.ts`.
 
+### Expanded Model Picker
+
+Upstream surfaces whatever the SDK's model list returns. We verified empirically that **both** `query.supportedModels()` and `initializationResult().models` only ever return the same 4 curated entries (`default` → Opus 4.8 1M, `sonnet`, `sonnet[1m]`, `haiku`). The SDK control API has no call that enumerates the version-pinned variants (Opus 4.7, Opus 4.6 1M, …), even though the bundled `claude` binary's model registry knows them and `setModel` accepts their IDs. So "pull every model from the SDK verbatim" is not possible — there is no fuller list to pull. This fork instead defines the picker explicitly to mirror the Claude Code native model picker.
+
+**Changes in `src/acp-agent.ts`:**
+
+1. **`FORK_MODEL_PICKER`** — A constant `ReadonlyArray` of the 7 picker entries in native-picker order, each with `value` / `displayName` / `description` / `family`. The `value`s are real model IDs verified to exist in the bundled binary's registry: `opus[1m]` (Opus 4.8 1M), `opus` (Opus 4.8), `claude-opus-4-7[1m]` (Opus 4.7 1M), `claude-opus-4-7` (Opus 4.7), `claude-opus-4-6[1m]` (Opus 4.6 1M), `sonnet` (Sonnet 4.6), `haiku` (Haiku 4.5).
+
+2. **`FORK_MODEL_CAPABILITY_FALLBACK`** — Per-family (`opus`/`sonnet`/`haiku`) capability flags used when the SDK doesn't surface a family template to copy from (e.g. a stripped-down test mock). Mirrors the live SDK's per-family shape.
+
+3. **`buildForkModelList(sdkModels)`** (exported) — Builds `FORK_MODEL_PICKER` into a `ModelInfo[]`, carrying each entry's display info verbatim and donating capability flags (effort levels, fast/auto mode, adaptive thinking) from the matching SDK **family template** (`default` → Opus, `sonnet`/`haiku` for the others), falling back to `FORK_MODEL_CAPABILITY_FALLBACK`. This keeps effort/fast/auto gating in `buildConfigOptions()` accurate. (Older Opus variants inherit the latest-Opus family flags — a small approximation the CLI re-validates at turn time.)
+
+4. **`createSession()` wiring** — When the user has **not** set an `availableModels` allowlist, `allowedModels` is `buildForkModelList(initializationResult.models)` (the fork picker). When they **have**, the original `applyAvailableModelsAllowlist(initializationResult.models, …)` behavior is kept verbatim (the user opted into a specific list). `initializationResult.models` (the SDK's real list) is still passed to `getAvailableModels()` as the skip-`setModel` reference, so pinning a fork-only ID like `claude-opus-4-7` correctly issues a `setModel` call while a value the SDK already surfaced is skipped.
+
+**Maintenance:** because the picker is now an explicit list, a new Opus/Sonnet/Haiku generation won't appear automatically — update `FORK_MODEL_PICKER` (and bump the bundled SDK so the new IDs resolve). The default selection is pinned to `opus[1m]`; if Anthropic moves the recommended default, update the list's first entry. Covered by `src/tests/fork-model-list.test.ts`; the resolution/allowlist/auto-mode cases live in `src/tests/acp-agent-settings.test.ts`.
+
 ## How to Merge Upstream Updates
 
 When pulling changes from `zed-industries/claude-agent-acp`:
@@ -181,6 +197,7 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - Session config improvements: `buildConfigOptions()` extended with model capability params, `applyConfigOptionValue()` handles `fast_mode`/`effort_level`, `prompt()` result handler syncs `fast_mode_state`
    - `context_display` dropdown: import from `./context-display.js`, `Session` fields (`contextDisplayView`, `contextDisplayState`), `buildConfigOptions()` `contextDisplay` param, `pushContextDisplayOption()` method, `prompt()` result-handler state update + one-shot `getContextUsage()` fetch, `compact_boundary` reset, `applyConfigOptionValue()` `context_display` branch, `applyConfigOptionValue()` model branch re-derives `contextDisplayState.rawMax`
    - `CLAUDE_CODE_THINKING_DISPLAY` env-var opt-in (~8 lines in `createSession()` near `maxThinkingTokens`): reads `process.env.CLAUDE_CODE_THINKING_DISPLAY` (`"summarized"` or `"omitted"`), spreads `thinking: { type: "adaptive", display }` into `Options` only when set. Opus 4.7 defaults `display` to `"omitted"`; this restores populated thinking streams when users opt in via Zed's `agent_servers.env`.
+   - Expanded model picker: `FORK_MODEL_PICKER` / `FORK_MODEL_CAPABILITY_FALLBACK` constants + `buildForkModelList()` (defined just before `applyAvailableModelsAllowlist`), and the `createSession()` `allowedModels` branch that uses `buildForkModelList(initializationResult.models)` when no `availableModels` allowlist is set. If upstream changes the `allowedModels`/`getAvailableModels` block, keep our no-allowlist branch pointed at `buildForkModelList`.
 
    If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, `setSessionConfigOption()`, or `applyConfigOptionValue()`, our blocks need to stay in the same logical positions.
 

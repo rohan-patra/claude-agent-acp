@@ -26,6 +26,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
       }),
       setModel: async () => {},
       setPermissionMode: async () => {},
+      applyFlagSettings: async () => {},
       supportedCommands: async () => [],
       [Symbol.asyncIterator]: async function* () {},
     };

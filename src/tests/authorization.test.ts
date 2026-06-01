@@ -11,6 +11,7 @@ const mockQuery = vi.hoisted(() =>
     }),
     setModel: vi.fn(),
     setPermissionMode: vi.fn(),
+    applyFlagSettings: vi.fn(),
     supportedCommands: vi.fn().mockResolvedValue([]),
   })),
 );

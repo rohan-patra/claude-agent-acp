@@ -2561,10 +2561,21 @@ export class ClaudeAcpAgent implements Agent {
     // own UI, not in `initializationResult.models`, so we filter here to keep
     // configOptions, the current-model resolver, and the stored modelInfos
     // consistent with what the user configured.
+    // Fork: expand the picker beyond the SDK's curated 4-model list. The SDK
+    // control API only enumerates `default`/`sonnet`/`sonnet[1m]`/`haiku` via
+    // both `initializationResult().models` and `supportedModels()`, so when the
+    // user hasn't pinned an explicit `availableModels` allowlist we surface the
+    // full Claude Code model list (Opus 4.8/4.7/4.6 + 1M variants) ourselves.
+    // Capability flags are donated from the SDK's family templates — see
+    // `buildForkModelList`. When the user *has* set an allowlist, we honor it
+    // verbatim (resolved against the SDK's real model info, unchanged behavior).
+    // `initializationResult.models` is still passed to `getAvailableModels` as
+    // the skip-setModel reference so pinning one of our added IDs (e.g.
+    // `claude-opus-4-7`) correctly issues a `setModel` call.
     const settingsAvailableModels = settingsManager.getSettings().availableModels;
     const allowedModels = Array.isArray(settingsAvailableModels)
       ? applyAvailableModelsAllowlist(initializationResult.models, settingsAvailableModels)
-      : initializationResult.models;
+      : buildForkModelList(initializationResult.models);
 
     const models = await getAvailableModels(
       q,
@@ -3083,6 +3094,127 @@ function resolveSettingsModel(
     return null;
   }
   return resolveModelPreference(models, settingsModel);
+}
+
+/**
+ * The Claude Code model picker the fork surfaces to Zed, in the same order the
+ * Claude Code desktop/CLI native picker uses.
+ *
+ * Why this is hardcoded: the SDK control API only enumerates a small curated
+ * set of models — `initializationResult().models` and `supportedModels()` both
+ * return just `default` / `sonnet` / `sonnet[1m]` / `haiku`. It never surfaces
+ * the version-pinned variants (Opus 4.7, Opus 4.6 1M, …) even though the CLI
+ * binary knows them and `setModel` accepts their IDs. There is no SDK call that
+ * returns the full list, so the fork has to spell it out. Each `value` below is
+ * a model ID verified to exist in the bundled `claude` binary's model registry.
+ *
+ * Maintenance: when Anthropic ships a new Opus/Sonnet/Haiku generation, update
+ * this list (and bump the bundled SDK so the new IDs resolve). `family` selects
+ * which SDK entry donates capability flags (effort levels, fast/auto mode) — see
+ * `buildForkModelList`.
+ */
+const FORK_MODEL_PICKER: ReadonlyArray<{
+  value: string;
+  displayName: string;
+  description: string;
+  family: "opus" | "sonnet" | "haiku";
+}> = [
+  {
+    value: "opus[1m]",
+    displayName: "Opus 4.8 1M",
+    description: "Opus 4.8 with 1M context",
+    family: "opus",
+  },
+  { value: "opus", displayName: "Opus 4.8", description: "Opus 4.8", family: "opus" },
+  {
+    value: "claude-opus-4-7[1m]",
+    displayName: "Opus 4.7 1M",
+    description: "Opus 4.7 with 1M context",
+    family: "opus",
+  },
+  { value: "claude-opus-4-7", displayName: "Opus 4.7", description: "Opus 4.7", family: "opus" },
+  {
+    value: "claude-opus-4-6[1m]",
+    displayName: "Opus 4.6 1M",
+    description: "Opus 4.6 with 1M context",
+    family: "opus",
+  },
+  { value: "sonnet", displayName: "Sonnet 4.6", description: "Sonnet 4.6", family: "sonnet" },
+  { value: "haiku", displayName: "Haiku 4.5", description: "Haiku 4.5", family: "haiku" },
+];
+
+/**
+ * Capability flags applied to a `FORK_MODEL_PICKER` entry when the SDK doesn't
+ * surface a family template to copy from (e.g. a stripped-down test mock, or a
+ * future CLI that drops one of the families from its curated list). Mirrors the
+ * shape the live SDK returns for each family.
+ */
+const FORK_MODEL_CAPABILITY_FALLBACK: Record<
+  "opus" | "sonnet" | "haiku",
+  Pick<
+    ModelInfo,
+    | "supportsEffort"
+    | "supportedEffortLevels"
+    | "supportsAdaptiveThinking"
+    | "supportsFastMode"
+    | "supportsAutoMode"
+  >
+> = {
+  opus: {
+    supportsEffort: true,
+    supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+    supportsAdaptiveThinking: true,
+    supportsFastMode: true,
+    supportsAutoMode: true,
+  },
+  sonnet: {
+    supportsEffort: true,
+    supportedEffortLevels: ["low", "medium", "high", "max"],
+    supportsAdaptiveThinking: true,
+    supportsAutoMode: true,
+  },
+  haiku: {},
+};
+
+/**
+ * Build the fork's model picker (`FORK_MODEL_PICKER`) as a `ModelInfo[]`,
+ * carrying each entry's `value`/`displayName`/`description` verbatim and
+ * donating capability flags (effort levels, fast/auto mode, adaptive thinking)
+ * from the matching SDK family template. The template is the SDK's own entry —
+ * `default` for Opus, `sonnet`/`haiku` for the others — so effort/fast/auto
+ * gating in `buildConfigOptions` stays accurate for the models the SDK does
+ * describe; the rest inherit the same family flags (a small approximation for
+ * older Opus variants, which is acceptable since the CLI re-validates at turn
+ * time). Falls back to `FORK_MODEL_CAPABILITY_FALLBACK` when the SDK omits a
+ * family entirely.
+ */
+export function buildForkModelList(sdkModels: ModelInfo[]): ModelInfo[] {
+  const pickTemplate = (family: "opus" | "sonnet" | "haiku"): ModelInfo | undefined => {
+    if (family === "opus") {
+      return (
+        sdkModels.find((m) => m.value === "default") ?? sdkModels.find((m) => /opus/i.test(m.value))
+      );
+    }
+    return (
+      sdkModels.find((m) => m.value === family) ??
+      sdkModels.find((m) => new RegExp(family, "i").test(m.value))
+    );
+  };
+
+  return FORK_MODEL_PICKER.map(({ value, displayName, description, family }) => {
+    const template = pickTemplate(family);
+    const caps = template ?? FORK_MODEL_CAPABILITY_FALLBACK[family];
+    return {
+      value,
+      displayName,
+      description,
+      supportsEffort: caps.supportsEffort,
+      supportedEffortLevels: caps.supportedEffortLevels,
+      supportsAdaptiveThinking: caps.supportsAdaptiveThinking,
+      supportsFastMode: caps.supportsFastMode,
+      supportsAutoMode: caps.supportsAutoMode,
+    };
+  });
 }
 
 /**
