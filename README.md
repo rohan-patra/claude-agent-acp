@@ -118,6 +118,7 @@ Plan files and other context artifacts are stored in `.context/` within the proj
 
 - **Effort level selector** — When the model supports it, a "thought level" config option appears in the session config.
 - **Fast mode toggle** — When the model supports it, an Off/Fast toggle appears. Server-side transitions (e.g., cooldown) are synced back to the UI.
+- **Ultracode** — When the model is xhigh-capable (e.g. Opus) and the Workflows feature is enabled, an "Ultracode" entry appears at the bottom of the effort/thought-level list. Selecting it turns on the SDK's `ultracode` mode (xhigh effort + standing dynamic-workflow orchestration); selecting any normal effort level turns it back off. It's session-scoped and never persisted.
 
 ### Expanded Model Picker
 

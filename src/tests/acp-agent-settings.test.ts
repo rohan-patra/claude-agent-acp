@@ -812,4 +812,106 @@ describe("ClaudeAcpAgent settings", () => {
       "claude-haiku-4-5",
     );
   });
+
+  describe("ultracode (effort-list entry)", () => {
+    const effortOption = (response: any) =>
+      response.configOptions?.find((o: any) => o.id === "effort");
+    const hasUltracode = (response: any) =>
+      !!effortOption(response)?.options?.some((o: any) => o.value === "ultracode");
+
+    it("appears in the effort list for an xhigh-capable model when workflows are enabled", async () => {
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      // No allowlist → the fork picker's default is Opus 4.8 1M, which is
+      // xhigh-capable; no settings disable workflows.
+      mockQuery();
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(hasUltracode(response)).toBe(true);
+      // Off by default → effort shows its normal value, not "ultracode".
+      expect(effortOption(response)?.currentValue).toBe("default");
+    });
+
+    it("is the selected effort value when seeded from settings.ultracode", async () => {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ ultracode: true }),
+      );
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+      mockQuery();
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(effortOption(response)?.currentValue).toBe("ultracode");
+    });
+
+    it("is absent from the effort list when workflows are disabled", async () => {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ disableWorkflows: true }),
+      );
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+      mockQuery();
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      // The effort dropdown still exists (Opus supports effort), just without
+      // the ultracode entry.
+      expect(effortOption(response)).toBeDefined();
+      expect(hasUltracode(response)).toBe(false);
+    });
+
+    it("is absent on a model without xhigh effort (Haiku)", async () => {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ model: "haiku" }),
+      );
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+      // SDK Haiku template carries no effort levels → not xhigh-capable.
+      querySpy.mockImplementation(() => ({
+        initializationResult: async () => ({
+          models: [{ value: "haiku", displayName: "Haiku", description: "Fast" }],
+        }),
+        setModel: vi.fn(),
+        supportedCommands: async () => [],
+      }));
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(hasUltracode(response)).toBe(false);
+    });
+  });
 });

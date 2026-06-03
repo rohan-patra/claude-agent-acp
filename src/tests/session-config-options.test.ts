@@ -296,6 +296,63 @@ describe("session config options", () => {
       expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("fast");
     });
 
+    // Ultracode is a pseudo entry inside the effort dropdown, not a separate
+    // toggle. Selecting it enables the SDK ultracode flag.
+    function pushEffortOption(includeUltracode: boolean) {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.ultracode = false;
+      session.workflowsEnabled = true;
+      // MOCK_CONFIG_OPTIONS already contains an effort option; update it in
+      // place so the single entry carries the ultracode pseudo-level.
+      session.configOptions = session.configOptions.map((o: any) =>
+        o.id === "effort"
+          ? {
+              ...o,
+              currentValue: "default",
+              options: [
+                { value: "default", name: "Default" },
+                { value: "high", name: "High" },
+                { value: "xhigh", name: "Xhigh" },
+                ...(includeUltracode ? [{ value: "ultracode", name: "Ultracode" }] : []),
+              ],
+            }
+          : o,
+      );
+      return session;
+    }
+
+    it("selecting 'ultracode' in the effort list enables the SDK ultracode flag", async () => {
+      const session = pushEffortOption(true);
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "ultracode",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ ultracode: true });
+      expect(session.ultracode).toBe(true);
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("ultracode");
+    });
+
+    it("selecting a real effort level turns ultracode off and applies the level", async () => {
+      const session = pushEffortOption(true);
+      session.ultracode = true;
+      session.configOptions = session.configOptions.map((o: any) =>
+        o.id === "effort" ? { ...o, currentValue: "ultracode" } : o,
+      );
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "high",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "high", ultracode: false });
+      expect(session.ultracode).toBe(false);
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
+    });
+
     it("resolves model alias 'opus' to full model ID", async () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,

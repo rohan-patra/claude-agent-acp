@@ -173,6 +173,13 @@ type Session = {
   abortController: AbortController;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   fastModeState: "off" | "cooldown" | "on";
+  /** Whether the "ultracode" toggle is currently on for this session (xhigh
+   *  effort + standing dynamic-workflow orchestration). Session-scoped — never
+   *  persisted. Seeded from `settings.ultracode` at session creation. */
+  ultracode: boolean;
+  /** Whether the Workflows feature is enabled (gates the ultracode toggle).
+   *  Computed once at session creation from settings + env. */
+  workflowsEnabled: boolean;
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Defaults to
@@ -2161,6 +2168,15 @@ export class ClaudeAcpAgent implements Agent {
         effectiveMax: null,
       };
 
+      // Ultracode (a pseudo effort level) requires an xhigh-capable model; drop
+      // it locally when the new model can't honor it so it doesn't silently
+      // reappear after a later switch back.
+      const newXhighCapable = (newModelInfo?.supportedEffortLevels ?? []).includes("xhigh");
+      const ultracodeWasOn = session.ultracode;
+      if (!newXhighCapable) {
+        session.ultracode = false;
+      }
+
       // Rebuild config options since effort levels depend on the selected model
       const effortOpt = session.configOptions.find((o) => o.id === "effort");
       const currentEffort =
@@ -2172,15 +2188,20 @@ export class ClaudeAcpAgent implements Agent {
         currentEffort,
         session.fastModeState,
         { view: session.contextDisplayView, state: session.contextDisplayState },
+        { workflowsEnabled: session.workflowsEnabled, state: session.ultracode },
       );
 
-      // Sync effort with the SDK if it changed after the model switch
+      // Sync effort with the SDK if it changed after the model switch. When the
+      // effort value is "ultracode" the SDK already holds the flag (and a model
+      // switch never turns it on), so only sync real effort levels — clearing
+      // ultracode too if the switch turned it off.
       const newEffortOpt = session.configOptions.find((o) => o.id === "effort");
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
-      if (newEffort !== currentEffort) {
+      if (newEffort !== currentEffort && newEffort !== "ultracode") {
         await session.query.applyFlagSettings({
           effortLevel: toSdkEffortLevel(newEffort),
+          ...(ultracodeWasOn && !session.ultracode ? { ultracode: false } : {}),
         });
       }
 
@@ -2216,9 +2237,20 @@ export class ClaudeAcpAgent implements Agent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
       if (configId === "effort") {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(value),
-        });
+        // "ultracode" is a pseudo effort level (xhigh effort + standing
+        // dynamic-workflow orchestration). Selecting it enables the SDK's
+        // session-scoped `ultracode` flag; selecting any real level/default
+        // turns it back off (and applies the chosen effort in the same call).
+        if (value === "ultracode") {
+          await session.query.applyFlagSettings({ ultracode: true });
+          session.ultracode = true;
+        } else {
+          await session.query.applyFlagSettings({
+            effortLevel: toSdkEffortLevel(value),
+            ...(session.ultracode ? { ultracode: false } : {}),
+          });
+          session.ultracode = false;
+        }
       }
     }
   }
@@ -2650,6 +2682,18 @@ export class ClaudeAcpAgent implements Agent {
 
     const initialFastModeState = initializationResult.fast_mode_state ?? "off";
 
+    // Ultracode gating: the Workflows feature must be enabled. The SDK has no
+    // control call that reports this, so we infer "enabled unless explicitly
+    // disabled" — `enableWorkflows` unset means plan-default (treated as on).
+    const sdkSettings = settingsManager.getSettings();
+    const workflowsEnabled =
+      sdkSettings.disableWorkflows !== true &&
+      sdkSettings.enableWorkflows !== false &&
+      !process.env.CLAUDE_CODE_DISABLE_WORKFLOWS;
+    // Seed from settings; the SDK already applied `settings.ultracode` itself,
+    // so we only mirror it into the UI state (no applyFlagSettings at init).
+    const initialUltracode = sdkSettings.ultracode === true;
+
     // Pre-fetch context-usage metadata so the dropdown can show the correct
     // window size (e.g. "-/1M" for Opus 1M) before the first turn. The
     // `inferContextWindowFromModel` regex doesn't know every model variant;
@@ -2680,14 +2724,18 @@ export class ClaudeAcpAgent implements Agent {
       settingsManager.getSettings().effortLevel,
       initialFastModeState,
       { view: initialContextDisplayView, state: initialContextDisplayState },
+      { workflowsEnabled, state: initialUltracode },
     );
 
-    // Apply the initial effort level to the SDK so it matches the UI default
+    // Apply the initial effort level to the SDK so it matches the UI default.
+    // "ultracode" is skipped: it's a pseudo effort level, not a real one, and
+    // the SDK already applied `settings.ultracode` itself (we only mirror it).
     const initialEffort = configOptions.find((o) => o.id === "effort");
     if (
       initialEffort &&
       typeof initialEffort.currentValue === "string" &&
-      initialEffort.currentValue !== "default"
+      initialEffort.currentValue !== "default" &&
+      initialEffort.currentValue !== "ultracode"
     ) {
       await q.applyFlagSettings({
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
@@ -2718,6 +2766,8 @@ export class ClaudeAcpAgent implements Agent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       fastModeState: initialFastModeState,
+      ultracode: initialUltracode,
+      workflowsEnabled,
       contextWindowSize: initialRawMax,
       contextDisplayView: initialContextDisplayView,
       contextDisplayState: initialContextDisplayState,
@@ -2905,6 +2955,7 @@ function buildConfigOptions(
   currentEffortLevel?: string,
   fastModeState?: "off" | "cooldown" | "on",
   contextDisplay?: { view: ContextDisplayView; state: ContextDisplayState },
+  ultracode?: { workflowsEnabled: boolean; state: boolean },
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -2957,13 +3008,23 @@ function buildConfigOptions(
     const validEffort =
       currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
 
+    // Ultracode (xhigh effort + standing dynamic-workflow orchestration) lives
+    // as an extra entry at the bottom of the effort list, mirroring the native
+    // Claude Code thinking-level menu. It only appears when the model is
+    // xhigh-capable and the Workflows feature is enabled (see `Settings.ultracode`).
+    const ultracodeEligible =
+      !!ultracode?.workflowsEnabled && (supportedLevels as string[]).includes("xhigh");
+    if (ultracodeEligible) {
+      effortOptions.push({ value: "ultracode", name: "Ultracode" });
+    }
+
     options.push({
       id: "effort",
       name: "Effort",
       description: "Available effort levels for this model",
       category: "thought_level",
       type: "select",
-      currentValue: validEffort,
+      currentValue: ultracodeEligible && ultracode?.state ? "ultracode" : validEffort,
       options: effortOptions,
     });
   }
