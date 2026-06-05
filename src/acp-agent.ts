@@ -2728,10 +2728,14 @@ export class ClaudeAcpAgent implements Agent {
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
       // Opt-in thinking display override via CLAUDE_CODE_THINKING_DISPLAY.
-      // Unset → SDK default (Opus 4.7 = "omitted"). When set, this fully
-      // overrides the MAX_THINKING_TOKENS-derived `thinking` above (and is in
-      // turn overridable by userProvidedOptions.thinking).
-      ...(thinkingDisplay && { thinking: { type: "adaptive", display: thinkingDisplay } }),
+      // `display` is valid on both adaptive and enabled thinking, so attach it
+      // to whatever `thinking` config is active (composing with a
+      // MAX_THINKING_TOKENS budget) rather than replacing it. With no budget,
+      // default to adaptive; when thinking is explicitly disabled, leave it off
+      // (disabled has no display). Still overridable by userProvidedOptions.
+      ...(thinkingDisplay && (thinking === undefined || thinking.type !== "disabled")
+        ? { thinking: { ...(thinking ?? { type: "adaptive" as const }), display: thinkingDisplay } }
+        : {}),
       ...userProvidedOptions,
       // Merge our fork's plansDirectory with any caller- or env-provided settings.
       // CLAUDE_MODEL_CONFIG env var is a fallback for model configuration (e.g. Bedrock

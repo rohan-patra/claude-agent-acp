@@ -488,15 +488,10 @@ describe("createSession options merging", () => {
 
   describe("thinking config from MAX_THINKING_TOKENS", () => {
     let originalMaxThinking: string | undefined;
-    // Fork: CLAUDE_CODE_THINKING_DISPLAY (if set in the runner's env) would
-    // override the MAX_THINKING_TOKENS-derived `thinking` config, so isolate it.
-    let originalThinkingDisplay: string | undefined;
 
     beforeEach(() => {
       originalMaxThinking = process.env.MAX_THINKING_TOKENS;
       delete process.env.MAX_THINKING_TOKENS;
-      originalThinkingDisplay = process.env.CLAUDE_CODE_THINKING_DISPLAY;
-      delete process.env.CLAUDE_CODE_THINKING_DISPLAY;
     });
 
     afterEach(() => {
@@ -504,11 +499,6 @@ describe("createSession options merging", () => {
         process.env.MAX_THINKING_TOKENS = originalMaxThinking;
       } else {
         delete process.env.MAX_THINKING_TOKENS;
-      }
-      if (originalThinkingDisplay !== undefined) {
-        process.env.CLAUDE_CODE_THINKING_DISPLAY = originalThinkingDisplay;
-      } else {
-        delete process.env.CLAUDE_CODE_THINKING_DISPLAY;
       }
     });
 
