@@ -1,7 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import { AgentSideConnection, RequestError, SessionNotification } from "@agentclientprotocol/sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -66,7 +69,7 @@ describe("createSession options merging", () => {
 
   it("merges user-provided disallowedTools with ACP internal list", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         claudeCode: {
@@ -86,7 +89,7 @@ describe("createSession options merging", () => {
 
   it("works when user provides no disallowedTools", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
     });
 
@@ -95,7 +98,7 @@ describe("createSession options merging", () => {
 
   it("works when user provides empty disallowedTools", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         claudeCode: {
@@ -111,7 +114,7 @@ describe("createSession options merging", () => {
 
   it("sets tools to empty array when disableBuiltInTools is true", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         disableBuiltInTools: true,
@@ -134,7 +137,7 @@ describe("createSession options merging", () => {
     const userPreToolUseHook = { hooks: [{ command: "echo pre" }] };
 
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         claudeCode: {
@@ -157,7 +160,7 @@ describe("createSession options merging", () => {
 
   it("inherits HOME and PATH from process.env when no env is provided", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
     });
 
@@ -167,7 +170,7 @@ describe("createSession options merging", () => {
 
   it("merges user-provided env vars on top of process.env", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         claudeCode: {
@@ -187,7 +190,7 @@ describe("createSession options merging", () => {
 
   it("allows user-provided env vars to override process.env entries", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         claudeCode: {
@@ -205,7 +208,7 @@ describe("createSession options merging", () => {
 
   it("defaults tools to claude_code preset when not provided", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
     });
 
@@ -214,7 +217,7 @@ describe("createSession options merging", () => {
 
   it("passes through user-provided tools string array", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         claudeCode: {
@@ -230,7 +233,7 @@ describe("createSession options merging", () => {
 
   it("explicit tools array takes precedence over disableBuiltInTools", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         disableBuiltInTools: true,
@@ -247,7 +250,7 @@ describe("createSession options merging", () => {
 
   it("passes through empty tools array to disable all built-in tools", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         claudeCode: {
@@ -263,7 +266,7 @@ describe("createSession options merging", () => {
 
   describe("systemPrompt via _meta", () => {
     it("defaults to the claude_code preset when not provided", async () => {
-      await agent.newSession({ cwd: "/test", mcpServers: [] });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(capturedOptions!.systemPrompt).toEqual({
         type: "preset",
@@ -273,7 +276,7 @@ describe("createSession options merging", () => {
 
     it("replaces the preset when a string is provided", async () => {
       await agent.newSession({
-        cwd: "/test",
+        cwd: process.cwd(),
         mcpServers: [],
         _meta: { systemPrompt: "custom prompt" },
       });
@@ -283,7 +286,7 @@ describe("createSession options merging", () => {
 
     it("forwards append", async () => {
       await agent.newSession({
-        cwd: "/test",
+        cwd: process.cwd(),
         mcpServers: [],
         _meta: { systemPrompt: { append: "extra instructions" } },
       });
@@ -297,7 +300,7 @@ describe("createSession options merging", () => {
 
     it("forwards excludeDynamicSections", async () => {
       await agent.newSession({
-        cwd: "/test",
+        cwd: process.cwd(),
         mcpServers: [],
         _meta: { systemPrompt: { excludeDynamicSections: true } },
       });
@@ -311,7 +314,7 @@ describe("createSession options merging", () => {
 
     it("forwards append and excludeDynamicSections together", async () => {
       await agent.newSession({
-        cwd: "/test",
+        cwd: process.cwd(),
         mcpServers: [],
         _meta: {
           systemPrompt: {
@@ -331,7 +334,7 @@ describe("createSession options merging", () => {
 
     it("ignores caller-provided type/preset overrides", async () => {
       await agent.newSession({
-        cwd: "/test",
+        cwd: process.cwd(),
         mcpServers: [],
         _meta: {
           systemPrompt: {
@@ -371,7 +374,7 @@ describe("createSession options merging", () => {
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
       });
 
-      await agent.newSession({ cwd: "/test", mcpServers: [] });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(capturedOptions!.settings).toEqual({
         plansDirectory: ".context/plans",
@@ -384,7 +387,7 @@ describe("createSession options merging", () => {
         availableModels: ["opus", "sonnet"],
       });
 
-      await agent.newSession({ cwd: "/test", mcpServers: [] });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(capturedOptions!.settings).toEqual({
         plansDirectory: ".context/plans",
@@ -398,7 +401,7 @@ describe("createSession options merging", () => {
         availableModels: ["opus"],
       });
 
-      await agent.newSession({ cwd: "/test", mcpServers: [] });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(capturedOptions!.settings).toEqual({
         plansDirectory: ".context/plans",
@@ -408,7 +411,7 @@ describe("createSession options merging", () => {
     });
 
     it("always injects plansDirectory when env var is not set", async () => {
-      await agent.newSession({ cwd: "/test", mcpServers: [] });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(capturedOptions!.settings).toEqual({
         plansDirectory: ".context/plans",
@@ -421,7 +424,7 @@ describe("createSession options merging", () => {
       });
 
       await agent.newSession({
-        cwd: "/test",
+        cwd: process.cwd(),
         mcpServers: [],
         _meta: {
           claudeCode: {
@@ -447,13 +450,13 @@ describe("createSession options merging", () => {
     it("throws on invalid JSON", async () => {
       process.env.CLAUDE_MODEL_CONFIG = "not-json";
 
-      await expect(agent.newSession({ cwd: "/test", mcpServers: [] })).rejects.toThrow();
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toThrow();
     });
   });
 
   it("merges user-provided mcpServers with ACP mcpServers", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [
         {
           name: "acp-server",
@@ -481,5 +484,104 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.mcpServers).toHaveProperty("user-server");
     // ACP-provided MCP server should also be present
     expect(capturedOptions!.mcpServers).toHaveProperty("acp-server");
+  });
+
+  describe("thinking config from MAX_THINKING_TOKENS", () => {
+    let originalMaxThinking: string | undefined;
+    // Fork: CLAUDE_CODE_THINKING_DISPLAY (if set in the runner's env) would
+    // override the MAX_THINKING_TOKENS-derived `thinking` config, so isolate it.
+    let originalThinkingDisplay: string | undefined;
+
+    beforeEach(() => {
+      originalMaxThinking = process.env.MAX_THINKING_TOKENS;
+      delete process.env.MAX_THINKING_TOKENS;
+      originalThinkingDisplay = process.env.CLAUDE_CODE_THINKING_DISPLAY;
+      delete process.env.CLAUDE_CODE_THINKING_DISPLAY;
+    });
+
+    afterEach(() => {
+      if (originalMaxThinking !== undefined) {
+        process.env.MAX_THINKING_TOKENS = originalMaxThinking;
+      } else {
+        delete process.env.MAX_THINKING_TOKENS;
+      }
+      if (originalThinkingDisplay !== undefined) {
+        process.env.CLAUDE_CODE_THINKING_DISPLAY = originalThinkingDisplay;
+      } else {
+        delete process.env.CLAUDE_CODE_THINKING_DISPLAY;
+      }
+    });
+
+    it("leaves thinking unset (SDK default) when env var is absent", async () => {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toBeUndefined();
+      // The deprecated option must not be set either.
+      expect(capturedOptions!.maxThinkingTokens).toBeUndefined();
+    });
+
+    it("maps 0 to disabled thinking", async () => {
+      process.env.MAX_THINKING_TOKENS = "0";
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toEqual({ type: "disabled" });
+    });
+
+    it("maps a positive value to a fixed thinking budget", async () => {
+      process.env.MAX_THINKING_TOKENS = "12000";
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toEqual({ type: "enabled", budgetTokens: 12000 });
+    });
+
+    it("ignores a non-numeric value", async () => {
+      process.env.MAX_THINKING_TOKENS = "lots";
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.thinking).toBeUndefined();
+    });
+
+    it("lets a user-provided thinking option override the env default", async () => {
+      process.env.MAX_THINKING_TOKENS = "12000";
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              thinking: { type: "adaptive" },
+            },
+          },
+        },
+      });
+      expect(capturedOptions!.thinking).toEqual({ type: "adaptive" });
+    });
+  });
+
+  describe("cwd validation", () => {
+    it("rejects a relative cwd with invalidParams", async () => {
+      await expect(
+        agent.newSession({ cwd: "relative/path", mcpServers: [] }),
+      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
+    });
+
+    it("rejects a non-existent cwd with invalidParams", async () => {
+      const missing = path.join(os.tmpdir(), "claude-acp-does-not-exist-xyz");
+      await expect(agent.newSession({ cwd: missing, mcpServers: [] })).rejects.toMatchObject({
+        code: RequestError.invalidParams().code,
+      });
+    });
+
+    it("rejects a cwd that points at a file with invalidParams", async () => {
+      const file = path.join(os.tmpdir(), "claude-acp-cwd-is-a-file.txt");
+      fs.writeFileSync(file, "not a directory");
+      try {
+        await expect(agent.newSession({ cwd: file, mcpServers: [] })).rejects.toMatchObject({
+          code: RequestError.invalidParams().code,
+        });
+      } finally {
+        fs.rmSync(file, { force: true });
+      }
+    });
+
+    it("accepts an existing absolute directory", async () => {
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).resolves.toBeDefined();
+    });
   });
 });

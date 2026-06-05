@@ -98,7 +98,7 @@ The `@anthropic-ai/claude-agent-sdk` dependency is repointed from the official n
 
 **Drop-in by design:** The patch repo keeps the package name `@anthropic-ai/claude-agent-sdk` and the same exports/peer deps, so every `import … from "@anthropic-ai/claude-agent-sdk"` in our source is unchanged — only the dependency spec in `package.json` differs. It ships prebuilt bundles (`sdk.mjs`, etc.) with no `prepare`/`postinstall` step, so the git install works directly. Because it's a `git+ssh` spec, clones/CI need GitHub SSH access.
 
-The patch tracks upstream: its `upstream` branch holds pristine npm tarballs (tagged `upstream-<version>`) and `main` carries the env-normalization patch merged on top. To pick up a newer SDK release, bump the pinned commit SHA to a newer `main` commit (see the patch repo's own `CLAUDE.md` for its re-merge workflow). The fork currently tracks SDK `0.3.161` (upstream `v0.40.0` pins `0.3.160`; the patch repo's nearest matching-or-newer vendor commit is `0.3.161`).
+The patch tracks upstream: its `upstream` branch holds pristine npm tarballs (tagged `upstream-<version>`) and `main` carries the env-normalization patch merged on top. To pick up a newer SDK release, bump the pinned commit SHA to a newer `main` commit (see the patch repo's own `CLAUDE.md` for its re-merge workflow). The fork currently tracks SDK `0.3.165` (upstream `v0.42.0` pins `0.3.165`; the patch repo vendors `0.3.165` exactly).
 
 **Checking for available patch-repo updates (use when an upstream merge bumps the SDK):**
 

@@ -34,10 +34,16 @@ import {
   describeAlwaysAllow,
   getAvailableSlashCommands,
   streamEventToAcpNotifications,
+  messageIdForGrouping,
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
-import { deleteSession, query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  deleteSession,
+  getSessionMessages,
+  query,
+  SDKAssistantMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
@@ -171,7 +177,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   }
 
   it("should connect to the ACP subprocess", async () => {
-    const { client, connection, newSessionResponse } = await setupTestSession("./");
+    const { client, connection, newSessionResponse } = await setupTestSession(process.cwd());
 
     await connection.prompt({
       prompt: [
@@ -1319,6 +1325,67 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
     const { value } = await q.next();
     expect(value).toMatchObject({ type: "system", session_id: sessionId });
   }, 10000);
+
+  // Pins the SDK invariant our `messageId` plumbing relies on: the Anthropic
+  // API message id is available at `message_start` (before any delta), is the
+  // same on the consolidated assistant message, and is recoverable from the
+  // persisted transcript — so a turn keeps one stable id across streaming and
+  // replay. The per-`stream_event` uuid is NOT used because it is unique per
+  // event and never persisted; this test would fail if a future SDK regressed
+  // any of those properties.
+  it("uses the API message id as a stable anchor across streaming and replay", async () => {
+    const sessionId = randomUUID();
+    const q = query({
+      prompt: "Reply with exactly these words and nothing else: hello there my friend",
+      options: {
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        sessionId,
+        includePartialMessages: true,
+        maxTurns: 1,
+        allowedTools: [],
+      },
+    });
+
+    let messageStartApiId: string | undefined;
+    let consolidatedApiId: string | undefined;
+    let sawDelta = false;
+    let allPartialsTopLevel = true;
+
+    for await (const message of q) {
+      if (message.type === "assistant") {
+        consolidatedApiId = message.message.id;
+      }
+      if (message.type !== "stream_event") continue;
+      // Every streaming partial must belong to the top-level agent
+      // (parent_tool_use_id === null). Subagent work is folded into tool-result
+      // messages rather than surfaced as partial streams, which is what lets us
+      // track a single anchor without keying by parent_tool_use_id.
+      if (message.parent_tool_use_id !== null) allPartialsTopLevel = false;
+      if (message.event.type === "message_start") {
+        messageStartApiId = message.event.message.id;
+      } else if (message.event.type === "content_block_delta") {
+        sawDelta = true;
+      }
+    }
+
+    // The API message id is present at message_start (before deltas), so we can
+    // tag every streamed chunk with it, and it is identical on the consolidated
+    // assistant message.
+    expect(messageStartApiId).toBeTruthy();
+    expect(sawDelta).toBe(true);
+    expect(allPartialsTopLevel).toBe(true);
+    expect(consolidatedApiId).toBe(messageStartApiId);
+
+    // ...and the SAME id is recoverable from the persisted transcript, so chunks
+    // grouped live keep their id when the session is replayed.
+    const persisted = await getSessionMessages(sessionId);
+    const replayedAssistant = persisted.find((m) => m.type === "assistant");
+    expect(replayedAssistant).toBeDefined();
+    expect((replayedAssistant!.message as { id?: string }).id).toBe(messageStartApiId);
+    // The helper used in production must derive that same id from the replayed
+    // message.
+    expect(messageIdForGrouping(replayedAssistant!)).toBe(messageStartApiId);
+  }, 30000);
 });
 
 describe("permission requests", () => {
@@ -1556,6 +1623,8 @@ describe("stop reason propagation", () => {
       idleResolvers: [],
       hasRunMainPrompt: false,
       taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -1707,6 +1776,8 @@ describe("stop reason propagation", () => {
       idleResolvers: [],
       hasRunMainPrompt: false,
       taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
 
     const response = await agent.prompt({
@@ -1873,6 +1944,8 @@ describe("session/close", () => {
       idleResolvers: [],
       hasRunMainPrompt: false,
       taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -1964,6 +2037,8 @@ describe("session/delete", () => {
       contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
       idleResolvers: [],
       hasRunMainPrompt: false,
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -1977,7 +2052,7 @@ describe("session/delete", () => {
     const agent = createMockAgent();
     const session = injectSession(agent, "session-1");
 
-    const result = await agent.unstable_deleteSession({ sessionId: "session-1" });
+    const result = await agent.deleteSession({ sessionId: "session-1" });
 
     expect(result).toEqual({});
     expect(agent.sessions["session-1"]).toBeUndefined();
@@ -1990,7 +2065,7 @@ describe("session/delete", () => {
   it("deletes a session from disk that is not currently active", async () => {
     const agent = createMockAgent();
 
-    const result = await agent.unstable_deleteSession({ sessionId: "not-active" });
+    const result = await agent.deleteSession({ sessionId: "not-active" });
 
     expect(result).toEqual({});
     expect(deleteSession).toHaveBeenCalledWith("not-active");
@@ -2000,7 +2075,7 @@ describe("session/delete", () => {
     const agent = createMockAgent();
     vi.mocked(deleteSession).mockRejectedValueOnce(new Error("Session not found on disk"));
 
-    await expect(agent.unstable_deleteSession({ sessionId: "missing" })).rejects.toThrow(
+    await expect(agent.deleteSession({ sessionId: "missing" })).rejects.toThrow(
       "Session not found on disk",
     );
   });
@@ -2010,7 +2085,7 @@ describe("session/delete", () => {
     injectSession(agent, "session-a");
     injectSession(agent, "session-b");
 
-    await agent.unstable_deleteSession({ sessionId: "session-a" });
+    await agent.deleteSession({ sessionId: "session-a" });
 
     expect(agent.sessions["session-a"]).toBeUndefined();
     expect(agent.sessions["session-b"]).toBeDefined();
@@ -2072,6 +2147,8 @@ describe("getOrCreateSession param change detection", () => {
       idleResolvers: [],
       hasRunMainPrompt: false,
       taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2314,6 +2391,8 @@ describe("usage_update computation", () => {
       idleResolvers: [],
       hasRunMainPrompt: false,
       taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -3151,6 +3230,49 @@ describe("usage_update computation", () => {
     // size should be 1000000 (Opus), not 200000 (the fallback if <synthetic> overrode the model)
     expect(usageUpdate.update.size).toBe(1000000);
   });
+
+  it("compact_boundary uses authoritative getContextUsage for used, keeps session window for size", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    // A 1M window learned earlier (e.g. from modelUsage) must survive compaction
+    // — getContextUsage's window field under-reports it, so we don't use it.
+    session.contextWindowSize = 1000000;
+    (session.query as any).getContextUsage = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 200000 });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.used).toBe(12345);
+    // size stays at the session's learned window, NOT getContextUsage's value.
+    expect(usageUpdate.update.size).toBe(1000000);
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
+  it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    session.contextWindowSize = 200000;
+    (session.query as any).getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.used).toBe(0);
+    expect(usageUpdate.update.size).toBe(200000);
+    expect(session.contextWindowSize).toBe(200000);
+  });
 });
 
 describe("emitRawSDKMessages", () => {
@@ -3221,6 +3343,8 @@ describe("emitRawSDKMessages", () => {
       idleResolvers: [],
       hasRunMainPrompt: false,
       taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -3456,6 +3580,8 @@ describe("result origin handling", () => {
       idleResolvers: [],
       hasRunMainPrompt: false,
       taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -3629,6 +3755,8 @@ describe("/btw side-question", () => {
       idleResolvers: [],
       hasRunMainPrompt: overrides.hasRunMainPrompt ?? true,
       btwQuery: overrides.btwQuery,
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
       taskState: new Map(),
     };
     return agent.sessions["test-session"];
@@ -3808,6 +3936,8 @@ describe("memory_recall handling", () => {
       contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
       idleResolvers: [],
       hasRunMainPrompt: false,
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -4045,6 +4175,8 @@ describe("post-error recovery", () => {
       contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
       idleResolvers: [],
       hasRunMainPrompt: false,
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return { interrupt };
   }
@@ -4118,6 +4250,193 @@ describe("post-error recovery", () => {
   });
 });
 
+describe("session/cancel wedge recovery (issue #680)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  // Generator that replays the prompt's user message and then blocks forever,
+  // simulating the SDK wedged in a `TaskOutput { block: true }` poll against a
+  // hung background task. `interrupt()` is a no-op — it does NOT unblock the
+  // generator, matching the SDK behavior described in the issue.
+  function injectWedgedSession(agent: ClaudeAcpAgent, opts: { interruptUnblocks?: boolean } = {}) {
+    const input = new Pushable<any>();
+    const interrupt = vi.fn(async () => {});
+    const close = vi.fn();
+    // A promise the wedged poll awaits. When `interruptUnblocks` is set, the
+    // mocked interrupt() resolves it so the generator yields a trailing idle —
+    // the normal, healthy interrupt path.
+    let releaseBlock!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseBlock = resolve;
+    });
+    if (opts.interruptUnblocks) {
+      interrupt.mockImplementation(async () => {
+        releaseBlock();
+      });
+    }
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const first = await iter.next();
+      if (!first.done && first.value) {
+        yield {
+          type: "user",
+          message: first.value.message,
+          parent_tool_use_id: null,
+          uuid: first.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      // Wedge: never yield again unless interrupt() releases us.
+      await blocked;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    const gen = Object.assign(messageGenerator(), { interrupt, close });
+    agent.sessions["test-session"] = {
+      query: gen as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      fastModeState: "off",
+      ultracode: false,
+      workflowsEnabled: true,
+      contextWindowSize: 200000,
+      contextDisplayView: "percent",
+      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
+      idleResolvers: [],
+      hasRunMainPrompt: false,
+      taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
+    };
+    return { interrupt };
+  }
+
+  it("resolves the pending prompt with cancelled when the SDK never yields after interrupt", async () => {
+    const agent = createMockAgent();
+    // Shrink the grace period so the test doesn't wait the production default.
+    agent.forceCancelGraceMs = 20;
+    const { interrupt } = injectWedgedSession(agent);
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+
+    // Let the loop consume the replay and block on the wedged query.next().
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("cancelled");
+    expect(interrupt).toHaveBeenCalled();
+  });
+
+  it("returns cancelled through the normal idle path without waiting the grace period when interrupt works", async () => {
+    const agent = createMockAgent();
+    // Large grace so that if the test ever falls through to the backstop it
+    // would hang past the test timeout instead of passing by accident.
+    agent.forceCancelGraceMs = 60_000;
+    const { interrupt } = injectWedgedSession(agent, { interruptUnblocks: true });
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("cancelled");
+    expect(interrupt).toHaveBeenCalled();
+    // Backstop timer must have been cleared so it can't fire later.
+    expect(agent.sessions["test-session"].forceCancelTimer).toBeUndefined();
+  });
+
+  it("does not arm the backstop when no prompt is running", async () => {
+    const agent = createMockAgent();
+    injectWedgedSession(agent);
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const session = agent.sessions["test-session"];
+    expect(session.cancelled).toBe(true);
+    expect(session.forceCancelTimer).toBeUndefined();
+  });
+
+  it("does not reset the force-cancel floor on repeated cancels", async () => {
+    const agent = createMockAgent();
+    // Long floor so the timer handle stays observable across both cancels.
+    agent.forceCancelGraceMs = 60_000;
+    injectWedgedSession(agent);
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.cancel({ sessionId: "test-session" });
+    const firstTimer = agent.sessions["test-session"].forceCancelTimer;
+    expect(firstTimer).toBeDefined();
+
+    await agent.cancel({ sessionId: "test-session" });
+    // Same handle: the second cancel did not clear-and-rearm (which would push
+    // the floor out). The deadline stays anchored to the first cancel.
+    expect(agent.sessions["test-session"].forceCancelTimer).toBe(firstTimer);
+
+    // Clean up the wedged prompt + long timer.
+    await agent.closeSession({ sessionId: "test-session" });
+    await expect(promptPromise).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
+  it("resolves an in-flight wedged prompt immediately when the session is closed", async () => {
+    const agent = createMockAgent();
+    // Large floor: if closeSession relied on the force-cancel timer this would
+    // hang past the test timeout. Teardown must wake the loop via
+    // cancelController instead.
+    agent.forceCancelGraceMs = 60_000;
+    injectWedgedSession(agent);
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.closeSession({ sessionId: "test-session" });
+
+    await expect(promptPromise).resolves.toEqual({ stopReason: "cancelled" });
+    expect(agent.sessions["test-session"]).toBeUndefined();
+  });
+});
+
 describe("streamEventToAcpNotifications", () => {
   it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
     const errors: unknown[][] = [];
@@ -4150,5 +4469,167 @@ describe("streamEventToAcpNotifications", () => {
 
     expect(result).toEqual([]);
     expect(errors).toEqual([]);
+  });
+
+  it("attaches the supplied messageId to streamed text chunks", () => {
+    const messageId = randomUUID();
+    const message = {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "hello" },
+      },
+    } as Parameters<typeof streamEventToAcpNotifications>[0];
+
+    const result = streamEventToAcpNotifications(
+      message,
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+
+    expect(result).toEqual([
+      {
+        sessionId: "test",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "hello" },
+          messageId,
+        },
+      },
+    ]);
+  });
+});
+
+describe("toAcpNotifications messageId", () => {
+  const messageId = "11111111-2222-3333-4444-555555555555";
+
+  it("sets messageId on agent message chunks from string content", () => {
+    const result = toAcpNotifications(
+      "hello world",
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+
+    expect(result).toEqual([
+      {
+        sessionId: "test",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "hello world" },
+          messageId,
+        },
+      },
+    ]);
+  });
+
+  it("sets messageId on user message chunks and thought chunks", () => {
+    const userResult = toAcpNotifications(
+      [{ type: "text", text: "hi" }],
+      "user",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+    expect(userResult[0].update).toMatchObject({
+      sessionUpdate: "user_message_chunk",
+      messageId,
+    });
+
+    const thoughtResult = toAcpNotifications(
+      [{ type: "thinking", thinking: "hmm", signature: "" }],
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+    expect(thoughtResult[0].update).toMatchObject({
+      sessionUpdate: "agent_thought_chunk",
+      messageId,
+    });
+  });
+
+  it("omits messageId when none is supplied", () => {
+    const result = toAcpNotifications(
+      "hello",
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+    );
+    expect(result[0].update).not.toHaveProperty("messageId");
+  });
+
+  it("never sets messageId on non-chunk updates (tool_call)", () => {
+    const result = toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "toolu_abc",
+          name: "Read",
+          input: { file_path: "/tmp/x" },
+        },
+      ],
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId, registerHooks: false },
+    );
+    expect(result[0].update.sessionUpdate).toBe("tool_call");
+    expect(result[0].update).not.toHaveProperty("messageId");
+  });
+});
+
+describe("messageIdForGrouping", () => {
+  it("uses the Anthropic API message id for assistant messages", () => {
+    const message = {
+      type: "assistant",
+      uuid: "de242400-cdb3-4af7-9856-d3b114b20af9",
+      message: { id: "msg_018DQGVuZbGYwVnvDakAP9Do", role: "assistant" },
+    };
+    // The API id is identical at message_start, on the consolidated message,
+    // and in the persisted transcript — so it stays stable across replay,
+    // unlike the per-message uuid.
+    expect(messageIdForGrouping(message)).toBe("msg_018DQGVuZbGYwVnvDakAP9Do");
+  });
+
+  it("falls back to the uuid for assistant messages without an API id", () => {
+    const message = {
+      type: "assistant",
+      uuid: "de242400-cdb3-4af7-9856-d3b114b20af9",
+      message: { role: "assistant" },
+    };
+    expect(messageIdForGrouping(message)).toBe("de242400-cdb3-4af7-9856-d3b114b20af9");
+  });
+
+  it("uses the uuid for user messages (they carry no API id and aren't streamed)", () => {
+    const message = {
+      type: "user",
+      uuid: "11111111-2222-3333-4444-555555555555",
+      message: { id: "msg_should_be_ignored", role: "user" },
+    };
+    expect(messageIdForGrouping(message)).toBe("11111111-2222-3333-4444-555555555555");
+  });
+
+  it("returns undefined when there is no usable id", () => {
+    expect(messageIdForGrouping({ type: "system", message: {} })).toBeUndefined();
+    expect(messageIdForGrouping({ type: "assistant", uuid: "", message: {} })).toBeUndefined();
   });
 });
