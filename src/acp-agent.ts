@@ -1883,8 +1883,11 @@ export class ClaudeAcpAgent implements Agent {
    * resumes the main session's transcript for context but uses
    * `persistSession: false` so nothing is written to disk. The assistant's
    * response is forwarded to Zed on the main ACP sessionId. Tools are
-   * disabled via `tools: []` + `disallowedTools: ["*"]` and turns are capped
-   * at 1, so the side query can only produce a single text answer.
+   * disabled via `tools: []` + `disallowedTools: ["*"]`, so the side query
+   * can only produce a text answer. Turns are deliberately NOT capped:
+   * with `maxTurns: 1`, a stray tool-call attempt (e.g. an MCP tool loaded
+   * from settings) would consume the only turn when denied and the answer
+   * would be cut off before the model could write it.
    *
    * Serialized behind any in-flight main turn via session.idleResolvers so
    * the two queries don't interleave output on the same ACP sessionId.
@@ -1940,15 +1943,15 @@ export class ClaudeAcpAgent implements Agent {
       session_id: params.sessionId,
       parent_tool_use_id: null,
     });
-    // maxTurns: 1 means the SDK won't need more input; close the stream so
-    // the subprocess sees EOF cleanly rather than relying solely on close().
+    // Only one user message is ever sent; close the stream so the
+    // subprocess sees EOF cleanly rather than relying solely on close().
+    // The read loop below breaks on the first `result` message.
     input.end();
 
     const canResume = session.hasRunMainPrompt;
     const sideOptions: Options = {
       cwd: session.cwd,
       persistSession: false,
-      maxTurns: 1,
       tools: [],
       disallowedTools: ["*"],
       systemPrompt: { type: "preset", preset: "claude_code" },
