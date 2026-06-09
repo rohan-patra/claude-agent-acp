@@ -222,13 +222,11 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     // Bad model is ignored at the usage site; with no allowlist the picker is
-    // the fork's model list, so it falls back to its first entry (Opus 4.8 1M).
+    // the fork's model list, so it falls back to its first entry (Fable 5).
     // No setModel call is needed because no override was applied — the SDK is
-    // already on its own default (also Opus 4.8 1M).
+    // already on its own default flagship.
     expect(setModelSpy).not.toHaveBeenCalled();
-    expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
-      "opus[1m]",
-    );
+    expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe("fable");
   });
 
   describe("auto mode availability per model", () => {
@@ -558,6 +556,7 @@ describe("ClaudeAcpAgent settings", () => {
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
       expect(modelOption.options.map((o: any) => o.value)).toEqual([
+        "fable",
         "opus[1m]",
         "opus",
         "claude-opus-4-7[1m]",

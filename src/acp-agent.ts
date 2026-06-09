@@ -3679,10 +3679,12 @@ function resolveSettingsModel(
  * returns the full list, so the fork has to spell it out. Each `value` below is
  * a model ID verified to exist in the bundled `claude` binary's model registry.
  *
- * Maintenance: when Anthropic ships a new Opus/Sonnet/Haiku generation, update
- * this list (and bump the bundled SDK so the new IDs resolve). `family` selects
- * which SDK entry donates capability flags (effort levels, fast/auto mode) — see
- * `buildForkModelList`.
+ * Maintenance: when Anthropic ships a new Fable/Opus/Sonnet/Haiku generation,
+ * update this list (and bump the bundled SDK so the new IDs resolve). `family`
+ * selects which SDK entry donates capability flags (effort levels, fast/auto
+ * mode) — see `buildForkModelList`. The first entry is the default selection
+ * (models[0] in `getAvailableModels` when no env/settings override applies);
+ * it is currently `fable` (Fable 5), the newest flagship.
  */
 const FORK_MODEL_PICKER: ReadonlyArray<{
   value: string;
@@ -3690,6 +3692,9 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   description: string;
   family: "opus" | "sonnet" | "haiku";
 }> = [
+  // Fable 5 is the newest flagship; it shares Opus's capability shape, so it
+  // donates flags from the SDK `default` (flagship) template via family "opus".
+  { value: "fable", displayName: "Fable 5", description: "Fable 5", family: "opus" },
   {
     value: "opus[1m]",
     displayName: "Opus 4.8 1M",

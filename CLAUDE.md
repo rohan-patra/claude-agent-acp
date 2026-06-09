@@ -177,7 +177,7 @@ Upstream surfaces whatever the SDK's model list returns. We verified empirically
 
 **Changes in `src/acp-agent.ts`:**
 
-1. **`FORK_MODEL_PICKER`** — A constant `ReadonlyArray` of the 7 picker entries in native-picker order, each with `value` / `displayName` / `description` / `family`. The `value`s are real model IDs verified to exist in the bundled binary's registry: `opus[1m]` (Opus 4.8 1M), `opus` (Opus 4.8), `claude-opus-4-7[1m]` (Opus 4.7 1M), `claude-opus-4-7` (Opus 4.7), `claude-opus-4-6[1m]` (Opus 4.6 1M), `sonnet` (Sonnet 4.6), `haiku` (Haiku 4.5).
+1. **`FORK_MODEL_PICKER`** — A constant `ReadonlyArray` of the 8 picker entries in native-picker order, each with `value` / `displayName` / `description` / `family`. The `value`s are real model IDs/aliases verified to exist in the bundled binary's registry: `fable` (Fable 5), `opus[1m]` (Opus 4.8 1M), `opus` (Opus 4.8), `claude-opus-4-7[1m]` (Opus 4.7 1M), `claude-opus-4-7` (Opus 4.7), `claude-opus-4-6[1m]` (Opus 4.6 1M), `sonnet` (Sonnet 4.6), `haiku` (Haiku 4.5). The `fable` entry is the newest flagship and sits first (the default selection); it carries `family: "opus"` so it donates the SDK `default` (flagship) capability template — Fable shares Opus's capability shape, so no separate family is needed.
 
 2. **`FORK_MODEL_CAPABILITY_FALLBACK`** — Per-family (`opus`/`sonnet`/`haiku`) capability flags used when the SDK doesn't surface a family template to copy from (e.g. a stripped-down test mock). Mirrors the live SDK's per-family shape.
 
@@ -185,7 +185,7 @@ Upstream surfaces whatever the SDK's model list returns. We verified empirically
 
 4. **`createSession()` wiring** — When the user has **not** set an `availableModels` allowlist, `allowedModels` is `buildForkModelList(initializationResult.models)` (the fork picker). When they **have**, the original `applyAvailableModelsAllowlist(initializationResult.models, …)` behavior is kept verbatim (the user opted into a specific list). `initializationResult.models` (the SDK's real list) is still passed to `getAvailableModels()` as the skip-`setModel` reference, so pinning a fork-only ID like `claude-opus-4-7` correctly issues a `setModel` call while a value the SDK already surfaced is skipped.
 
-**Maintenance:** because the picker is now an explicit list, a new Opus/Sonnet/Haiku generation won't appear automatically — update `FORK_MODEL_PICKER` (and bump the bundled SDK so the new IDs resolve). The default selection is pinned to `opus[1m]`; if Anthropic moves the recommended default, update the list's first entry. Covered by `src/tests/fork-model-list.test.ts`; the resolution/allowlist/auto-mode cases live in `src/tests/acp-agent-settings.test.ts`.
+**Maintenance:** because the picker is now an explicit list, a new Fable/Opus/Sonnet/Haiku generation won't appear automatically — update `FORK_MODEL_PICKER` (and bump the bundled SDK so the new IDs resolve). The default selection is the first entry (currently `fable`); if Anthropic moves the recommended default, update the list's first entry. Covered by `src/tests/fork-model-list.test.ts`; the resolution/allowlist/auto-mode cases live in `src/tests/acp-agent-settings.test.ts`.
 
 ## How to Merge Upstream Updates
 

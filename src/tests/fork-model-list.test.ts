@@ -40,6 +40,7 @@ describe("buildForkModelList", () => {
   it("surfaces the full Claude Code picker in order, replacing the SDK's 4-model list", () => {
     const models = buildForkModelList(SDK_MODELS);
     expect(models.map((m) => [m.value, m.displayName])).toEqual([
+      ["fable", "Fable 5"],
       ["opus[1m]", "Opus 4.8 1M"],
       ["opus", "Opus 4.8"],
       ["claude-opus-4-7[1m]", "Opus 4.7 1M"],
@@ -52,7 +53,13 @@ describe("buildForkModelList", () => {
 
   it("donates Opus capability flags from the SDK `default` template to every Opus entry", () => {
     const models = buildForkModelList(SDK_MODELS);
-    for (const value of ["opus[1m]", "opus", "claude-opus-4-7[1m]", "claude-opus-4-7", "claude-opus-4-6[1m]"]) {
+    for (const value of [
+      "opus[1m]",
+      "opus",
+      "claude-opus-4-7[1m]",
+      "claude-opus-4-7",
+      "claude-opus-4-6[1m]",
+    ]) {
       const m = models.find((x) => x.value === value)!;
       expect(m.supportsEffort).toBe(true);
       expect(m.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
