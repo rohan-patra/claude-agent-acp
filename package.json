@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.43.0",
+  "version": "0.44.0",
   "description": "An ACP-compatible coding agent powered by the Claude Agent SDK (TypeScript)",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",
@@ -65,7 +65,7 @@
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "0.102.0",
+    "@anthropic-ai/sdk": "0.103.0",
     "@eslint/js": "10.0.1",
     "@types/node": "25.9.2",
     "@typescript-eslint/eslint-plugin": "8.61.0",
