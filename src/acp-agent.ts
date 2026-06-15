@@ -3682,12 +3682,12 @@ function resolveSettingsModel(
  * returns the full list, so the fork has to spell it out. Each `value` below is
  * a model ID verified to exist in the bundled `claude` binary's model registry.
  *
- * Maintenance: when Anthropic ships a new Fable/Opus/Sonnet/Haiku generation,
- * update this list (and bump the bundled SDK so the new IDs resolve). `family`
- * selects which SDK entry donates capability flags (effort levels, fast/auto
- * mode) — see `buildForkModelList`. The first entry is the default selection
- * (models[0] in `getAvailableModels` when no env/settings override applies);
- * it is currently `fable` (Fable 5), the newest flagship.
+ * Maintenance: when Anthropic ships a new Opus/Sonnet/Haiku generation, update
+ * this list (and bump the bundled SDK so the new IDs resolve). `family` selects
+ * which SDK entry donates capability flags (effort levels, fast/auto mode) — see
+ * `buildForkModelList`. The first entry is the default selection (models[0] in
+ * `getAvailableModels` when no env/settings override applies); it is currently
+ * `opus[1m]` (Opus 4.8 1M), the recommended flagship.
  */
 const FORK_MODEL_PICKER: ReadonlyArray<{
   value: string;
@@ -3695,9 +3695,6 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   description: string;
   family: "opus" | "sonnet" | "haiku";
 }> = [
-  // Fable 5 is the newest flagship; it shares Opus's capability shape, so it
-  // donates flags from the SDK `default` (flagship) template via family "opus".
-  { value: "fable", displayName: "Fable 5", description: "Fable 5", family: "opus" },
   {
     value: "opus[1m]",
     displayName: "Opus 4.8 1M",
@@ -3837,6 +3834,21 @@ function applyAvailableModelsAllowlist(sdkModels: ModelInfo[], allowlist: string
       result.push({ value: trimmed, displayName: trimmed, description: "" });
     }
     seen.add(trimmed);
+  }
+
+  // The custom model option (ANTHROPIC_CUSTOM_MODEL_OPTION) is exempt from the
+  // allowlist, the same way Default is. Per the model-config docs it adds an
+  // entry "without replacing the built-in aliases" and "appears at the bottom of
+  // the /model picker", so we append it last and skip the allowlist filter; this
+  // keeps a slim alias allowlist from hiding the custom model row.
+  // https://code.claude.com/docs/en/model-config#add-a-custom-model-option
+  const customModelOption = process.env.ANTHROPIC_CUSTOM_MODEL_OPTION?.trim();
+  if (customModelOption && !seen.has(customModelOption)) {
+    const customModel = sdkModels.find((m) => m.value === customModelOption);
+    if (customModel) {
+      result.push(customModel);
+      seen.add(customModel.value);
+    }
   }
 
   return result;

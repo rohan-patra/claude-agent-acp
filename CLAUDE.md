@@ -98,7 +98,7 @@ The `@anthropic-ai/claude-agent-sdk` dependency is repointed from the official n
 
 **Drop-in by design:** The patch repo keeps the package name `@anthropic-ai/claude-agent-sdk` and the same exports/peer deps, so every `import … from "@anthropic-ai/claude-agent-sdk"` in our source is unchanged — only the dependency spec in `package.json` differs. It ships prebuilt bundles (`sdk.mjs`, etc.) with no `prepare`/`postinstall` step, so the git install works directly. Because it's a `git+ssh` spec, clones/CI need GitHub SSH access.
 
-The patch tracks upstream: its `upstream` branch holds pristine npm tarballs (tagged `upstream-<version>`) and `main` carries the env-normalization patch merged on top. To pick up a newer SDK release, bump the pinned commit SHA to a newer `main` commit (see the patch repo's own `CLAUDE.md` for its re-merge workflow). The fork currently tracks SDK `0.3.170` (upstream `v0.44.0` pins `0.3.170`; the patch repo vendors `0.3.170` exactly).
+The patch tracks upstream: its `upstream` branch holds pristine npm tarballs (tagged `upstream-<version>`) and `main` carries the env-normalization patch merged on top. To pick up a newer SDK release, bump the pinned commit SHA to a newer `main` commit (see the patch repo's own `CLAUDE.md` for its re-merge workflow). The fork currently tracks SDK `0.3.177` (upstream `v0.45.0` pins `0.3.177`; the patch repo vendors `0.3.177` exactly).
 
 **Checking for available patch-repo updates (use when an upstream merge bumps the SDK):**
 
@@ -177,7 +177,7 @@ Upstream surfaces whatever the SDK's model list returns. We verified empirically
 
 **Changes in `src/acp-agent.ts`:**
 
-1. **`FORK_MODEL_PICKER`** — A constant `ReadonlyArray` of the 8 picker entries in native-picker order, each with `value` / `displayName` / `description` / `family`. The `value`s are real model IDs/aliases verified to exist in the bundled binary's registry: `fable` (Fable 5), `opus[1m]` (Opus 4.8 1M), `opus` (Opus 4.8), `claude-opus-4-7[1m]` (Opus 4.7 1M), `claude-opus-4-7` (Opus 4.7), `claude-opus-4-6[1m]` (Opus 4.6 1M), `sonnet` (Sonnet 4.6), `haiku` (Haiku 4.5). The `fable` entry is the newest flagship and sits first (the default selection); it carries `family: "opus"` so it donates the SDK `default` (flagship) capability template — Fable shares Opus's capability shape, so no separate family is needed.
+1. **`FORK_MODEL_PICKER`** — A constant `ReadonlyArray` of the 7 picker entries in native-picker order, each with `value` / `displayName` / `description` / `family`. The `value`s are real model IDs/aliases verified to exist in the bundled binary's registry: `opus[1m]` (Opus 4.8 1M), `opus` (Opus 4.8), `claude-opus-4-7[1m]` (Opus 4.7 1M), `claude-opus-4-7` (Opus 4.7), `claude-opus-4-6[1m]` (Opus 4.6 1M), `sonnet` (Sonnet 4.6), `haiku` (Haiku 4.5). The first entry (`opus[1m]`) is the default selection. (Fable 5 was briefly listed first but Anthropic removed the model, so it was dropped.)
 
 2. **`FORK_MODEL_CAPABILITY_FALLBACK`** — Per-family (`opus`/`sonnet`/`haiku`) capability flags used when the SDK doesn't surface a family template to copy from (e.g. a stripped-down test mock). Mirrors the live SDK's per-family shape.
 
@@ -185,7 +185,7 @@ Upstream surfaces whatever the SDK's model list returns. We verified empirically
 
 4. **`createSession()` wiring** — When the user has **not** set an `availableModels` allowlist, `allowedModels` is `buildForkModelList(initializationResult.models)` (the fork picker). When they **have**, the original `applyAvailableModelsAllowlist(initializationResult.models, …)` behavior is kept verbatim (the user opted into a specific list). `initializationResult.models` (the SDK's real list) is still passed to `getAvailableModels()` as the skip-`setModel` reference, so pinning a fork-only ID like `claude-opus-4-7` correctly issues a `setModel` call while a value the SDK already surfaced is skipped.
 
-**Maintenance:** because the picker is now an explicit list, a new Fable/Opus/Sonnet/Haiku generation won't appear automatically — update `FORK_MODEL_PICKER` (and bump the bundled SDK so the new IDs resolve). The default selection is the first entry (currently `fable`); if Anthropic moves the recommended default, update the list's first entry. Covered by `src/tests/fork-model-list.test.ts`; the resolution/allowlist/auto-mode cases live in `src/tests/acp-agent-settings.test.ts`.
+**Maintenance:** because the picker is now an explicit list, a new Opus/Sonnet/Haiku generation won't appear automatically — update `FORK_MODEL_PICKER` (and bump the bundled SDK so the new IDs resolve). The default selection is the first entry (currently `opus[1m]`); if Anthropic moves the recommended default, update the list's first entry. Covered by `src/tests/fork-model-list.test.ts`; the resolution/allowlist/auto-mode cases live in `src/tests/acp-agent-settings.test.ts`.
 
 ## How to Merge Upstream Updates
 
