@@ -130,8 +130,6 @@ describe("session config options", () => {
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       fastModeState: "off",
       contextWindowSize: 200000,
-      contextDisplayView: "percent",
-      contextDisplayState: { used: null, rawMax: 200000, effectiveMax: null },
     };
   }
 
@@ -222,6 +220,31 @@ describe("session config options", () => {
           value: "invalid-mode",
         }),
       ).rejects.toThrow("Invalid value for config option mode: invalid-mode");
+    });
+
+    it("rejects mode and config changes once the query stream has closed (husk session)", async () => {
+      // After an unexpected stream death the session lingers as a husk
+      // (queryClosed=true) so prompt() can answer with a clear error. The
+      // config/mode handlers must do the same rather than calling setModel/
+      // setPermissionMode on the closed query.
+      const session = (agent as unknown as { sessions: Record<string, { queryClosed?: boolean }> })
+        .sessions[SESSION_ID];
+      session.queryClosed = true;
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "model",
+          value: "claude-sonnet-4-6",
+        }),
+      ).rejects.toThrow(/start a new session/);
+      await expect(agent.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" })).rejects.toThrow(
+        /start a new session/,
+      );
+
+      // Short-circuited before touching the (closed) query.
+      expect(setModelSpy).not.toHaveBeenCalled();
+      expect(setPermissionModeSpy).not.toHaveBeenCalled();
     });
 
     it("changes mode, sends current_mode_update but not config_option_update", async () => {
@@ -429,103 +452,6 @@ describe("session config options", () => {
 
       const modelOption = response.configOptions.find((o) => o.id === "model");
       expect(modelOption?.currentValue).toBe("claude-opus-4-5");
-    });
-
-    it("changes context_display view and returns updated currentValue", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.configOptions.push({
-        id: "context_display",
-        name: "Context",
-        type: "select",
-        category: "model",
-        description: "How context usage is shown",
-        currentValue: "percent",
-        options: [
-          { value: "percent", name: "Ctx: —", description: "Percentage of context window used" },
-          { value: "numeric", name: "Ctx: —", description: "Tokens used / context window size" },
-        ],
-      });
-
-      const response = await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "context_display",
-        value: "numeric",
-      });
-
-      expect(session.contextDisplayView).toBe("numeric");
-      expect(response.configOptions.find((o) => o.id === "context_display")?.currentValue).toBe(
-        "numeric",
-      );
-    });
-
-    it("rejects unknown context_display view values", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.configOptions.push({
-        id: "context_display",
-        name: "Context",
-        type: "select",
-        category: "model",
-        currentValue: "percent",
-        options: [
-          { value: "percent", name: "Ctx: —" },
-          { value: "numeric", name: "Ctx: —" },
-        ],
-      });
-
-      await expect(
-        agent.setSessionConfigOption({
-          sessionId: SESSION_ID,
-          configId: "context_display",
-          value: "bogus",
-        }),
-      ).rejects.toThrow("Invalid value for config option context_display: bogus");
-      expect(session.contextDisplayView).toBe("percent");
-    });
-
-    it("rebuilds context_display option when model changes so its rawMax reflects the new window", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      // Seed with a populated state and a stale context_display option
-      // keyed to the 200k default. Switching to the 1M-variant model should
-      // re-derive rawMax and rebuild every option's label against it.
-      session.contextDisplayState = { used: 50_000, rawMax: 200_000, effectiveMax: 184_000 };
-      session.configOptions.push({
-        id: "context_display",
-        name: "Context",
-        type: "select",
-        category: "model",
-        currentValue: "numeric",
-        options: [
-          { value: "percent", name: "25%" },
-          { value: "numeric", name: "50k/200k" },
-          { value: "until_compact", name: "134k to compact" },
-        ],
-      });
-      session.contextDisplayView = "numeric";
-
-      const response = await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-opus-4-5-1m",
-      });
-
-      // rawMax re-derives to 1M; effectiveMax is invalidated pending next turn.
-      expect(session.contextDisplayState.rawMax).toBe(1_000_000);
-      expect(session.contextDisplayState.effectiveMax).toBeNull();
-
-      const ctxOption = response.configOptions.find((o) => o.id === "context_display");
-      expect(ctxOption?.currentValue).toBe("numeric");
-      // Labels must reflect the new window size, not the seeded 200k strings.
-      if (!ctxOption || ctxOption.type !== "select") throw new Error("missing context_display");
-      const byValue = Object.fromEntries(
-        ctxOption.options
-          .filter((o): o is { value: string; name: string } => "value" in o)
-          .map((o) => [o.value, o.name]),
-      );
-      // used=50k still cached, rawMax now 1M → 50/1000 = 5%
-      expect(byValue["percent"]).toBe("5%");
-      expect(byValue["numeric"]).toBe("50k/1M");
-      // effectiveMax invalidated → until_compact falls back to placeholder
-      expect(byValue["until_compact"]).toBe("-");
     });
   });
 
