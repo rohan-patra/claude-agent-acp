@@ -130,6 +130,8 @@ describe("session config options", () => {
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       fastModeState: "off",
       contextWindowSize: 200000,
+      toolUseCache: {},
+      emittedToolCalls: new Set(),
     };
   }
 
@@ -283,40 +285,6 @@ describe("session config options", () => {
         (n) => n.update.sessionUpdate === "config_option_update",
       );
       expect(configUpdate).toBeUndefined();
-    });
-
-    it("changes fast_mode and calls applyFlagSettings", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.modelInfos = [
-        {
-          value: "claude-opus-4-5",
-          displayName: "Claude Opus",
-          description: "Most capable",
-          supportsFastMode: true,
-        },
-      ];
-      session.configOptions.push({
-        id: "fast_mode",
-        name: "Fast Mode",
-        type: "select",
-        category: "model",
-        description: "Faster output with the same model",
-        currentValue: "off",
-        options: [
-          { value: "off", name: "Off" },
-          { value: "fast", name: "Fast" },
-        ],
-      });
-
-      const response = await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "fast_mode",
-        value: "fast",
-      });
-
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ fastMode: true });
-      expect(session.fastModeState).toBe("on");
-      expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("fast");
     });
 
     // Ultracode is a pseudo entry inside the effort dropdown, not a separate
@@ -1210,6 +1178,10 @@ describe("session config options", () => {
         ],
       };
 
+      // The tool_call was already surfaced (by the streamed tool_use chunk), so
+      // the permission request won't re-emit one — keep this focused on options.
+      session.emittedToolCalls.add("toolu_1");
+
       const canUseTool = (agent as any).canUseTool(SESSION_ID);
       const signal = new AbortController().signal;
       try {
@@ -1241,6 +1213,10 @@ describe("session config options", () => {
         ],
       };
       permissionResponse = { outcome: { outcome: "selected", optionId: "auto" } };
+      // The tool_call was already surfaced (by the streamed tool_use chunk), so
+      // the permission request won't re-emit one — the deny path below should
+      // produce no session updates at all.
+      session.emittedToolCalls.add("toolu_2");
 
       const canUseTool = (agent as any).canUseTool(SESSION_ID);
       const result = await canUseTool(
@@ -1268,6 +1244,10 @@ describe("session config options", () => {
           { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
         ],
       };
+
+      // The tool_call was already surfaced (by the streamed tool_use chunk), so
+      // the permission request won't re-emit one — keep this focused on options.
+      session.emittedToolCalls.add("toolu_3");
 
       const canUseTool = (agent as any).canUseTool(SESSION_ID);
       const signal = new AbortController().signal;

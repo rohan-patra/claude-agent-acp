@@ -17,6 +17,7 @@ import {
   ListSessionsResponse,
   LoadSessionRequest,
   LoadSessionResponse,
+  LogoutRequest,
   methods,
   ndJsonStream,
   NewSessionRequest,
@@ -50,6 +51,8 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
+  FastModeState,
+  getSessionInfo,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -73,12 +76,14 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
 import {
   applyAskElicitationResponse,
@@ -111,6 +116,8 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+
+const execFileAsync = promisify(execFile);
 
 const MAX_TITLE_LENGTH = 256;
 
@@ -245,6 +252,10 @@ type Session = {
   /** The currently selected main-thread agent name, or "default" for the
    *  standard Claude Code agent (no `agent` flag applied). */
   currentAgent: string;
+  /** Whether Fast mode is currently enabled for this session. Tracked as the
+   *  user's intent so it persists across model switches; the Fast mode config
+   *  option is only surfaced while the selected model supports it. */
+  fastModeEnabled: boolean;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
    *  (after a grace period) to force the active turn to settle "cancelled" when
@@ -258,7 +269,6 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
-  fastModeState: "off" | "cooldown" | "on";
   /** Whether the "ultracode" toggle is currently on for this session (xhigh
    *  effort + standing dynamic-workflow orchestration). Session-scoped — never
    *  persisted. Seeded from `settings.ultracode` at session creation. */
@@ -285,12 +295,26 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** Last session title we pushed to the client via `session_info_update`.
+   *  The SDK auto-generates a title in a background task and persists it to the
+   *  session file; we poll it on each turn-end (`session_state_changed: idle`)
+   *  and only notify the client when it actually changes. Undefined until the
+   *  first title is observed. */
+  lastTitle?: string;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
    *  `tool_result` time so a long-running session doesn't accumulate every
    *  tool call for its whole lifetime. */
   toolUseCache: ToolUseCache;
+  /** Tracks which tool_use ids we've already emitted a `tool_call` for, so the
+   *  second source to encounter a tool call sends a `tool_call_update` instead
+   *  of a duplicate `tool_call`. The SDK can invoke `canUseTool` (→ a permission
+   *  request, which emits the tool_call eagerly so the client has it before
+   *  being asked to approve it) either before or after the assistant message's
+   *  tool_use block streams; this set makes the two paths converge regardless of
+   *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
+  emittedToolCalls: Set<string>;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -871,6 +895,9 @@ export class ClaudeAcpAgent {
           http: true,
           sse: true,
         },
+        auth: {
+          logout: {},
+        },
         loadSession: true,
         sessionCapabilities: {
           additionalDirectories: {},
@@ -966,12 +993,70 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /** Read the SDK-maintained title for a session and, if it changed since the
+   *  last time we looked, notify the client with a `session_info_update`. The
+   *  SDK has no push event for the title it auto-generates in the background, so
+   *  we pull it at turn-end. A missing session file or read error is non-fatal:
+   *  the title is best-effort and another turn will retry. */
+  private async maybeUpdateSessionTitle(sessionId: string, session: Session): Promise<void> {
+    let info;
+    try {
+      info = await getSessionInfo(sessionId, { dir: session.cwd });
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
+      return;
+    }
+    // `customTitle` is a user-set `/rename`; `summary` is the auto-generated
+    // title (or first prompt). Prefer the explicit title when present.
+    const rawTitle = info?.customTitle ?? info?.summary;
+    if (!rawTitle) {
+      return;
+    }
+    const title = sanitizeTitle(rawTitle);
+    if (title === session.lastTitle) {
+      return;
+    }
+    session.lastTitle = title;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        title,
+        updatedAt: new Date(info!.lastModified).toISOString(),
+      },
+    });
+  }
+
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
       return;
     }
     throw new Error("Method not implemented.");
+  }
+
+  async logout(_params: LogoutRequest): Promise<void> {
+    // Clear in-memory gateway credentials supplied via `authenticate`. The
+    // gateway method never touches the on-disk credential store, so dropping
+    // this reference is the whole logout for that path.
+    this.gatewayAuthRequest = undefined;
+
+    // For the Claude/Console login methods the credentials live in the native
+    // CLI's store (keychain or config dir), which only the binary can clear.
+    // `claude auth logout` is non-interactive and idempotent.
+    const cliPath = await claudeCliPath();
+    try {
+      await execFileAsync(cliPath, ["auth", "logout"]);
+    } catch (error) {
+      const stderr =
+        typeof error === "object" && error && "stderr" in error
+          ? String((error as { stderr: unknown }).stderr).trim()
+          : undefined;
+      throw RequestError.internalError(
+        { stderr: stderr || undefined },
+        `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -1309,6 +1394,10 @@ export class ClaudeAcpAgent {
           case "system":
             switch (message.subtype) {
               case "init":
+                // A fresh `system`/init (e.g. after reinitialize) can carry an
+                // updated Fast mode state; reconcile it with what we seeded at
+                // session creation.
+                await this.syncFastModeState(message.session_id, session, message.fast_mode_state);
                 break;
               case "status": {
                 if (message.status === "compacting") {
@@ -1406,6 +1495,11 @@ export class ClaudeAcpAgent {
                   if (session.cancelled) {
                     settleActive({ stopReason: "cancelled" });
                   }
+                  // The SDK generates the session title in a background task and
+                  // persists it to the session file; `idle` is the turn-over
+                  // signal, so it's the point at which a new title may have
+                  // landed. Push it to the client if it changed.
+                  await this.maybeUpdateSessionTitle(params.sessionId, session);
                 }
                 break;
               }
@@ -1561,6 +1655,7 @@ export class ClaudeAcpAgent {
               case "api_retry":
               case "thinking_tokens":
               case "model_refusal_fallback":
+              case "model_refusal_no_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -1574,6 +1669,14 @@ export class ClaudeAcpAgent {
             // They should not influence the user-turn lifecycle (stop reason,
             // slash-command output forwarding) but their cost is real.
             const isTaskNotification = message.origin?.kind === "task-notification";
+
+            // Reconcile the Fast mode toggle with the SDK's reported state.
+            // Gated to user-driven turns like every other side effect below; a
+            // background followup's state lands on the next user turn's result.
+            // Runs even when the turn errors or was cancelled.
+            if (!isTaskNotification) {
+              await this.syncFastModeState(params.sessionId, session, message.fast_mode_state);
+            }
 
             // A user-turn result needs an active turn so its stop reason is
             // attributed and the turn settles at idle. Local-only commands carry
@@ -1626,26 +1729,6 @@ export class ClaudeAcpAgent {
                   }),
                 },
               });
-            }
-
-            // Sync fast mode state from SDK result
-            if ("fast_mode_state" in message && message.fast_mode_state) {
-              const newState = message.fast_mode_state;
-              if (session.fastModeState !== newState) {
-                session.fastModeState = newState;
-                session.configOptions = session.configOptions.map((o) =>
-                  o.id === "fast_mode" && o.type === "select"
-                    ? { ...o, currentValue: newState === "on" ? "fast" : "off" }
-                    : o,
-                );
-                await this.client.sessionUpdate({
-                  sessionId: params.sessionId,
-                  update: {
-                    sessionUpdate: "config_option_update",
-                    configOptions: session.configOptions,
-                  },
-                });
-              }
             }
 
             if (session.cancelled) {
@@ -1881,6 +1964,7 @@ export class ClaudeAcpAgent {
                 fileEditInterceptor: session.fileEditInterceptor,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                emittedToolCalls: session.emittedToolCalls,
                 messageId: currentStreamMessageId,
               },
             )) {
@@ -2113,6 +2197,7 @@ export class ClaudeAcpAgent {
                 fileEditInterceptor: session.fileEditInterceptor,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
               },
             )) {
@@ -2543,7 +2628,7 @@ export class ClaudeAcpAgent {
     }
 
     await this.applySessionMode(params.sessionId, params.modeId);
-    await this.updateConfigOption(params.sessionId, "mode", params.modeId);
+    await this.updateConfigOption(params.sessionId, MODE_CONFIG_ID, params.modeId);
     return {};
   }
 
@@ -2561,13 +2646,22 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
-    if (typeof params.value !== "string") {
-      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
-    }
 
     const option = session.configOptions.find((o) => o.id === params.configId);
     if (!option) {
       throw new Error(`Unknown config option: ${params.configId}`);
+    }
+
+    // Fast mode carries a boolean value (for Clients that opted into boolean
+    // config options) or the "on"/"off" select fallback, so it bypasses the
+    // string-only validation the select-style options below rely on.
+    if (params.configId === FAST_MODE_CONFIG_ID) {
+      await this.applyFastMode(session, resolveFastModeEnabled(params));
+      return { configOptions: session.configOptions };
+    }
+
+    if (typeof params.value !== "string") {
+      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
     }
 
     const allValues =
@@ -2579,7 +2673,7 @@ export class ClaudeAcpAgent {
     // For model options, fall back to resolveModelPreference when the exact
     // value doesn't match.  This lets callers use human-friendly aliases like
     // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
-    if (!validValue && params.configId === "model") {
+    if (!validValue && params.configId === MODEL_CONFIG_ID) {
       const modelInfos: ModelInfo[] = allValues.map((o) => ({
         value: o.value,
         displayName: o.name,
@@ -2599,7 +2693,7 @@ export class ClaudeAcpAgent {
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
 
-    if (params.configId === "mode") {
+    if (params.configId === MODE_CONFIG_ID) {
       await this.applySessionMode(params.sessionId, resolvedValue);
       await this.client.sessionUpdate({
         sessionId: params.sessionId,
@@ -2608,7 +2702,7 @@ export class ClaudeAcpAgent {
           currentModeId: resolvedValue,
         },
       });
-    } else if (params.configId === "model") {
+    } else if (params.configId === MODEL_CONFIG_ID) {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
@@ -2720,8 +2814,21 @@ export class ClaudeAcpAgent {
    *  longer leaves the `await` hanging. */
   private async requestPermissionFromClient(
     params: RequestPermissionRequest,
+    toolName: string,
     signal: AbortSignal,
   ): Promise<RequestPermissionResponse> {
+    // The SDK may invoke `canUseTool` (and therefore this permission request)
+    // before the assistant message's tool_use block streams to us. Some ACP clients
+    // expect the `tool_call` a permission request references to already exist,
+    // so emit it now if it hasn't been sent yet. The streamed tool_use chunk
+    // later refines it with a `tool_call_update` rather than emitting a
+    // duplicate (see `emittedToolCalls` in `toAcpNotifications`).
+    await this.ensureToolCallEmitted(
+      params.sessionId,
+      toolName,
+      params.toolCall.toolCallId,
+      params.toolCall.rawInput,
+    );
     try {
       return await this.client.requestPermission(params, signal);
     } catch (error) {
@@ -2730,6 +2837,39 @@ export class ClaudeAcpAgent {
       }
       throw error;
     }
+  }
+
+  /** Emit the `tool_call` a permission request references if it hasn't been sent
+   *  yet, so the client has the tool call before being asked to approve it. The
+   *  matching streamed tool_use chunk later refines it with a `tool_call_update`
+   *  instead of emitting a duplicate (see `emittedToolCalls`). Built via the same
+   *  `toolCallNotification` helper as the streamed path so the two are identical.
+   *  Tools the stream renders as a plan (TodoWrite) or suppresses (Task*) are
+   *  skipped so a permission prompt for them never surfaces a stray tool_call. */
+  private async ensureToolCallEmitted(
+    sessionId: string,
+    toolName: string,
+    toolCallId: string,
+    toolInput: unknown,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session || !shouldEmitToolCall(toolName)) {
+      return;
+    }
+    if (session.emittedToolCalls.has(toolCallId)) {
+      return;
+    }
+    session.emittedToolCalls.add(toolCallId);
+    const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: toolCallNotification(
+        { id: toolCallId, name: toolName, input: toolInput },
+        toolInput,
+        supportsTerminalOutput,
+        session.cwd,
+      ),
+    });
   }
 
   canUseTool(sessionId: string): CanUseTool {
@@ -2749,6 +2889,9 @@ export class ClaudeAcpAgent {
       // than the interactive dialog). Present it as an ACP form elicitation and
       // feed the answers back as updatedInput for the tool's own call() to read.
       if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
+        // Like permission requests, the elicitation references this toolUseID, so
+        // make sure the tool_call has surfaced to the client before we send it.
+        await this.ensureToolCallEmitted(sessionId, toolName, toolUseID, toolInput);
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
       }
 
@@ -2793,6 +2936,7 @@ export class ClaudeAcpAgent {
               ),
             },
           },
+          toolName,
           signal,
         );
 
@@ -2816,7 +2960,7 @@ export class ClaudeAcpAgent {
               currentModeId: selectedMode,
             },
           });
-          await this.updateConfigOption(sessionId, "mode", selectedMode);
+          await this.updateConfigOption(sessionId, MODE_CONFIG_ID, selectedMode);
 
           return {
             behavior: "allow",
@@ -2865,6 +3009,7 @@ export class ClaudeAcpAgent {
             ),
           },
         },
+        toolName,
         signal,
       );
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -3015,12 +3160,12 @@ export class ClaudeAcpAgent {
     configId: string,
     value: string,
   ): Promise<void> {
-    if (configId === "mode") {
+    if (configId === MODE_CONFIG_ID) {
       session.modes = { ...session.modes, currentModeId: value };
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
-    } else if (configId === "model") {
+    } else if (configId === MODEL_CONFIG_ID) {
       // `ModelInfo.supportsAutoMode` is the canonical SDK signal for clamping
       // modes below; its `displayName`/`description` also let us infer the
       // context window for semantic aliases (e.g. `default`) whose ID alone
@@ -3079,7 +3224,7 @@ export class ClaudeAcpAgent {
       }
 
       // Rebuild config options since effort levels depend on the selected model
-      const effortOpt = session.configOptions.find((o) => o.id === "effort");
+      const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const currentEffort =
         typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
       session.configOptions = buildConfigOptions(
@@ -3087,17 +3232,24 @@ export class ClaudeAcpAgent {
         session.models,
         session.modelInfos,
         currentEffort,
-        session.fastModeState,
-        { workflowsEnabled: session.workflowsEnabled, state: session.ultracode },
         session.agents,
         session.currentAgent,
+        {
+          // The toggle follows the newly selected model: it disappears when the
+          // model lacks fast support and reappears (with the retained user
+          // intent) when a supporting model is selected again.
+          supported: newModelInfo?.supportsFastMode ?? false,
+          enabled: session.fastModeEnabled,
+          useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+        },
+        { workflowsEnabled: session.workflowsEnabled, state: session.ultracode },
       );
 
       // Sync effort with the SDK if it changed after the model switch. When the
       // effort value is "ultracode" the SDK already holds the flag (and a model
       // switch never turns it on), so only sync real effort levels — clearing
       // ultracode too if the switch turned it off.
-      const newEffortOpt = session.configOptions.find((o) => o.id === "effort");
+      const newEffortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort && newEffort !== "ultracode") {
@@ -3122,14 +3274,7 @@ export class ClaudeAcpAgent {
           },
         });
       }
-    } else if (configId === "fast_mode") {
-      const fastMode = value === "fast";
-      await session.query.applyFlagSettings({ fastMode });
-      session.fastModeState = fastMode ? "on" : "off";
-      session.configOptions = session.configOptions.map((o) =>
-        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
-      );
-    } else if (configId === "agent") {
+    } else if (configId === AGENT_CONFIG_ID) {
       // Live agent switch — no subprocess restart needed. Apply the SDK flag
       // first so a rejected control request leaves both `currentAgent` and the
       // config option untouched (no UI/SDK desync). Passing `null` clears the
@@ -3146,7 +3291,7 @@ export class ClaudeAcpAgent {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
-      if (configId === "effort") {
+      if (configId === EFFORT_CONFIG_ID) {
         // "ultracode" is a pseudo effort level (xhigh effort + standing
         // dynamic-workflow orchestration). Selecting it enables the SDK's
         // session-scoped `ultracode` flag; selecting any real level/default
@@ -3163,6 +3308,77 @@ export class ClaudeAcpAgent {
         }
       }
     }
+  }
+
+  /** Replace the Fast mode option in `session.configOptions` so it reflects
+   *  `enabled` (and the client's current boolean-capability). A no-op when the
+   *  option isn't present, so callers must confirm the current model surfaces
+   *  it first. */
+  private refreshFastModeOption(session: Session, enabled: boolean): void {
+    const refreshed = createFastModeConfigOption(
+      enabled,
+      clientSupportsBooleanConfigOptions(this.clientCapabilities),
+    );
+    session.configOptions = session.configOptions.map((o) =>
+      o.id === FAST_MODE_CONFIG_ID ? refreshed : o,
+    );
+  }
+
+  /** Toggle Fast mode for a session: push the SDK flag, record the user's
+   *  intent, and refresh the Fast mode config option in place. Only reached
+   *  once the option exists (i.e. the current model supports fast mode), so the
+   *  option is guaranteed to be present in `configOptions`. */
+  private async applyFastMode(session: Session, enabled: boolean): Promise<void> {
+    // Apply the SDK flag first so a rejected control request leaves both the
+    // session state and the config option untouched (no UI/SDK desync).
+    await session.query.applyFlagSettings({ fastMode: enabled });
+    session.fastModeEnabled = enabled;
+    this.refreshFastModeOption(session, enabled);
+  }
+
+  /** Reconcile the session's Fast mode toggle with an SDK-reported
+   *  `fast_mode_state` (delivered on `system`/init and on user-turn `result`s).
+   *  The SDK can flip fast mode independently of the user — e.g. back to `on`
+   *  once a rate-limit `cooldown` clears — so we mirror definitive on/off
+   *  changes into the config option and notify the client.
+   *
+   *  Guards, in order:
+   *   - absent state: nothing to reconcile.
+   *   - no Fast mode option: the current model doesn't support fast mode, so the
+   *     reported state reflects capability, not the user's intent. Leave the
+   *     retained setting untouched so it's correct when a supporting model is
+   *     reselected (the source of the earlier intent-clobber bug was mutating it
+   *     here).
+   *   - `cooldown`: a transient suspension of an already-enabled fast mode.
+   *     Leave the toggle as-is rather than flapping it — and never let a stray
+   *     cooldown spuriously enable a toggle the user has off. */
+  private async syncFastModeState(
+    sessionId: string,
+    session: Session,
+    state: FastModeState | undefined,
+  ): Promise<void> {
+    if (state === undefined) {
+      return;
+    }
+    if (!session.configOptions.some((o) => o.id === FAST_MODE_CONFIG_ID)) {
+      return;
+    }
+    if (state === "cooldown") {
+      return;
+    }
+    const enabled = state === "on";
+    if (enabled === session.fastModeEnabled) {
+      return;
+    }
+    session.fastModeEnabled = enabled;
+    this.refreshFastModeOption(session, enabled);
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: session.configOptions,
+      },
+    });
   }
 
   private async getOrCreateSession(params: {
@@ -3473,7 +3689,7 @@ export class ClaudeAcpAgent {
                       currentModeId: "plan",
                     },
                   });
-                  await this.updateConfigOption(sessionId, "mode", "plan");
+                  await this.updateConfigOption(sessionId, MODE_CONFIG_ID, "plan");
                 },
                 onFileRead: fileEditInterceptor
                   ? (filePath: string, content: string) =>
@@ -3595,8 +3811,13 @@ export class ClaudeAcpAgent {
     // the skip-setModel reference so pinning one of our added IDs (e.g.
     // `claude-opus-4-7`) correctly issues a `setModel` call.
     const settingsAvailableModels = settingsManager.getSettings().availableModels;
+    const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
     const allowedModels = Array.isArray(settingsAvailableModels)
-      ? applyAvailableModelsAllowlist(initializationResult.models, settingsAvailableModels)
+      ? applyAvailableModelsAllowlist(
+          initializationResult.models,
+          settingsAvailableModels,
+          settingsModelOverrides,
+        )
       : buildForkModelList(initializationResult.models);
 
     const models = await getAvailableModels(
@@ -3647,8 +3868,6 @@ export class ClaudeAcpAgent {
       availableModes,
     };
 
-    const initialFastModeState = initializationResult.fast_mode_state ?? "off";
-
     // Ultracode gating: the Workflows feature must be enabled. The SDK has no
     // control call that reports this, so we infer "enabled unless explicitly
     // disabled" — `enableWorkflows` unset means plan-default (treated as on).
@@ -3673,21 +3892,34 @@ export class ClaudeAcpAgent {
         ? requestedAgent
         : DEFAULT_AGENT_ID;
 
+    // Seed Fast mode from the SDK's reported state so the UI reflects reality
+    // (the CLI may start a session with fast mode already on, or force it off
+    // when `fastModePerSessionOptIn` is set). The toggle is only surfaced while
+    // the resolved model advertises `supportsFastMode`.
+    const fastModeEnabled =
+      initializationResult.fast_mode_state !== undefined &&
+      fastModeStateEnabled(initializationResult.fast_mode_state);
+    const fastMode: FastModeOptionState = {
+      supported: currentModelInfo?.supportsFastMode ?? false,
+      enabled: fastModeEnabled,
+      useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+    };
+
     const configOptions = buildConfigOptions(
       modes,
       models,
       allowedModels,
       settingsManager.getSettings().effortLevel,
-      initialFastModeState,
-      { workflowsEnabled, state: initialUltracode },
       agents,
       currentAgent,
+      fastMode,
+      { workflowsEnabled, state: initialUltracode },
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default.
     // "ultracode" is skipped: it's a pseudo effort level, not a real one, and
     // the SDK already applied `settings.ultracode` itself (we only mirror it).
-    const initialEffort = configOptions.find((o) => o.id === "effort");
+    const initialEffort = configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
     if (
       initialEffort &&
       typeof initialEffort.currentValue === "string" &&
@@ -3718,9 +3950,9 @@ export class ClaudeAcpAgent {
       fileEditInterceptor,
       agents,
       currentAgent,
+      fastModeEnabled,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
-      fastModeState: initialFastModeState,
       ultracode: initialUltracode,
       workflowsEnabled,
       contextWindowSize:
@@ -3733,6 +3965,7 @@ export class ClaudeAcpAgent {
       hasRunMainPrompt: false,
       taskState,
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
 
@@ -3942,19 +4175,111 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
   }
 }
 
+/** Stable ids for the session config options surfaced via `configOptions`.
+ *  Centralized so the option declarations in `buildConfigOptions` and the
+ *  handlers in `setSessionConfigOption`/`applyConfigOptionValue` reference the
+ *  same identifiers and can't drift apart. */
+export const MODE_CONFIG_ID = "mode";
+export const MODEL_CONFIG_ID = "model";
+export const EFFORT_CONFIG_ID = "effort";
+export const AGENT_CONFIG_ID = "agent";
+export const FAST_MODE_CONFIG_ID = "fast";
+
+/** Select-fallback values used when the client has not opted into boolean
+ *  config options (see {@link createFastModeConfigOption}). */
+export const FAST_MODE_ON = "on";
+export const FAST_MODE_OFF = "off";
+const FAST_MODE_DESCRIPTION = "Faster responses on supported models";
+
+/** Map the SDK's tri-state `fast_mode_state` onto the boolean config toggle.
+ *  `cooldown` (fast mode temporarily suspended after a rate limit, per the SDK
+ *  docs) keeps the toggle on so it reflects the user's intent — only an
+ *  explicit `off` clears it. */
+export function fastModeStateEnabled(state: FastModeState): boolean {
+  return state !== "off";
+}
+
+/** Whether the Client advertised support for boolean session config options
+ *  (`session.configOptions.boolean`). Agents MUST only send `type: "boolean"`
+ *  config options to Clients that opt in; otherwise we fall back to a `select`.
+ *  See https://agentclientprotocol.com/rfds/boolean-config-option. */
+export function clientSupportsBooleanConfigOptions(
+  clientCapabilities?: ClientCapabilities | null,
+): boolean {
+  return clientCapabilities?.session?.configOptions?.boolean != null;
+}
+
+/** Build the Fast mode config option. When the Client supports boolean config
+ *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
+ *  a two-value `select` ("on"/"off") so older Clients still get a usable
+ *  control. */
+export function createFastModeConfigOption(
+  enabled: boolean,
+  useBooleanOption: boolean,
+): SessionConfigOption {
+  const base = {
+    id: FAST_MODE_CONFIG_ID,
+    name: "Fast mode",
+    description: FAST_MODE_DESCRIPTION,
+    category: "model_config",
+  } as const;
+
+  if (useBooleanOption) {
+    return { ...base, type: "boolean", currentValue: enabled };
+  }
+
+  return {
+    ...base,
+    type: "select",
+    currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
+    options: [
+      { value: FAST_MODE_ON, name: "On" },
+      { value: FAST_MODE_OFF, name: "Off" },
+    ],
+  };
+}
+
+/** Resolve the requested Fast mode value from a `session/set_config_option`
+ *  request. Accepts a native boolean (boolean-capable Clients) or the
+ *  "on"/"off" select-fallback strings. */
+export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): boolean {
+  const value = params.value;
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (value === FAST_MODE_ON) {
+    return true;
+  }
+  if (value === FAST_MODE_OFF) {
+    return false;
+  }
+  throw new Error(`Invalid value for config option ${FAST_MODE_CONFIG_ID}: ${value}`);
+}
+
+/** Per-model Fast mode state threaded into {@link buildConfigOptions}. The
+ *  option is only surfaced when the current model `supported`s fast mode. */
+export type FastModeOptionState = {
+  supported: boolean;
+  enabled: boolean;
+  /** Whether the Client opted into boolean config options. */
+  useBooleanOption: boolean;
+};
+
 export function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
   modelInfos: ModelInfo[],
   currentEffortLevel?: string,
-  fastModeState?: "off" | "cooldown" | "on",
-  ultracode?: { workflowsEnabled: boolean; state: boolean },
   agents: AgentInfo[] = [],
   currentAgent: string = DEFAULT_AGENT_ID,
+  fastMode?: FastModeOptionState,
+  // Fork-only param kept LAST so upstream's positional call sites/tests never
+  // shift when we re-merge (see CLAUDE.md merge notes).
+  ultracode?: { workflowsEnabled: boolean; state: boolean },
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
-      id: "mode",
+      id: MODE_CONFIG_ID,
       name: "Mode",
       description: "Session permission mode",
       category: "mode",
@@ -3967,7 +4292,7 @@ export function buildConfigOptions(
       })),
     },
     {
-      id: "model",
+      id: MODEL_CONFIG_ID,
       name: "Model",
       description: "AI model to use",
       category: "model",
@@ -4014,7 +4339,7 @@ export function buildConfigOptions(
     }
 
     options.push({
-      id: "effort",
+      id: EFFORT_CONFIG_ID,
       name: "Effort",
       description: "Available effort levels for this model",
       category: "thought_level",
@@ -4024,19 +4349,11 @@ export function buildConfigOptions(
     });
   }
 
-  if (currentModelInfo?.supportsFastMode && fastModeState) {
-    options.push({
-      id: "fast_mode",
-      name: "Fast Mode",
-      type: "select",
-      category: "model",
-      description: "Faster output with the same model",
-      currentValue: fastModeState === "on" ? "fast" : "off",
-      options: [
-        { value: "off", name: "Off" },
-        { value: "fast", name: "Fast" },
-      ],
-    });
+  // Surface the Fast mode toggle only when the current model supports it. The
+  // option renders as a native boolean toggle for Clients that opted in, and a
+  // two-value select otherwise.
+  if (fastMode?.supported) {
+    options.push(createFastModeConfigOption(fastMode.enabled, fastMode.useBooleanOption));
   }
 
   // Only surface the Agent picker when there's a real choice — i.e. the user
@@ -4045,7 +4362,7 @@ export function buildConfigOptions(
   // entry, so we omit the option entirely.
   if (agents.length > 0) {
     options.push({
-      id: "agent",
+      id: AGENT_CONFIG_ID,
       name: "Agent",
       description: "Main-thread agent persona",
       type: "select",
@@ -4068,14 +4385,17 @@ export function buildConfigOptions(
 // but the SDK model list uses IDs like "claude-opus-4-6-1m".
 const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
 
-// Captures a model family version such as `4-6` or `4.7` so we can keep
-// `claude-opus-4-6` from being copied onto the SDK's `opus` alias when that
-// alias currently resolves to a different family version (e.g. Opus 4.7).
-const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)[-.](\d+)\b/;
+// Captures a model family version: `4-6`/`4.7` for dated generations, or a
+// bare `5` for single-number ones like "Sonnet 5". Used to keep a pinned
+// `claude-opus-4-6` from matching the `opus` alias once it points at 4.7.
+const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)(?:[-.](\d+))?\b/;
 
 function extractModelFamilyVersion(s: string): string | null {
-  const match = s.match(MODEL_FAMILY_VERSION_PATTERN);
-  return match ? `${match[1]}.${match[2]}` : null;
+  // Strip "[1m]"-style context hints first — that digit is context window
+  // size, not a model generation version.
+  const match = s.replace(/\[\d+m\]/gi, "").match(MODEL_FAMILY_VERSION_PATTERN);
+  if (!match) return null;
+  return match[2] ? `${match[1]}.${match[2]}` : match[1];
 }
 
 function modelVersionsCompatible(preference: string, candidate: ModelInfo): boolean {
@@ -4121,7 +4441,7 @@ function scoreModelMatch(model: ModelInfo, tokens: string[], contextHint?: strin
   return score;
 }
 
-function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
+export function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
   const trimmed = preference.trim();
   if (!trimmed) return null;
 
@@ -4135,6 +4455,18 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
       model.displayName.toLowerCase() === lower,
   );
   if (directMatch) return directMatch;
+
+  // Exact match on the alias's canonical resolved id (e.g. a pinned
+  // "claude-sonnet-5" against the "sonnet" row's `resolvedModel`). SDK-
+  // reported and unambiguous, so it's tried before the fuzzier tiers below.
+  // "default" is skipped first since it shares a resolvedModel with
+  // whichever alias the CLI currently recommends — a specific pin should
+  // land on that named alias, not "default".
+  const resolvedMatch =
+    models.find(
+      (model) => model.value !== "default" && model.resolvedModel?.toLowerCase() === lower,
+    ) ?? models.find((model) => model.resolvedModel?.toLowerCase() === lower);
+  if (resolvedMatch) return resolvedMatch;
 
   // Substring match
   const includesMatch = models.find((model) => {
@@ -4191,12 +4523,12 @@ function resolveSettingsModel(
  * returns the full list, so the fork has to spell it out. Each `value` below is
  * a model ID verified to exist in the bundled `claude` binary's model registry.
  *
- * Maintenance: when Anthropic ships a new Opus/Sonnet/Haiku generation, update
- * this list (and bump the bundled SDK so the new IDs resolve). `family` selects
- * which SDK entry donates capability flags (effort levels, fast/auto mode) — see
- * `buildForkModelList`. The first entry is the default selection (models[0] in
- * `getAvailableModels` when no env/settings override applies); it is currently
- * `opus[1m]` (Opus 4.8 1M), the recommended flagship.
+ * Maintenance: when Anthropic ships a new Fable/Opus/Sonnet/Haiku generation,
+ * update this list (and bump the bundled SDK so the new IDs resolve). `family`
+ * selects which SDK entry donates capability flags (effort levels, fast/auto
+ * mode) — see `buildForkModelList`. The first entry is the default selection
+ * (models[0] in `getAvailableModels` when no env/settings override applies);
+ * it is currently `fable` (Fable 5), the newest flagship.
  */
 const FORK_MODEL_PICKER: ReadonlyArray<{
   value: string;
@@ -4204,6 +4536,9 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   description: string;
   family: "opus" | "sonnet" | "haiku";
 }> = [
+  // Fable 5 is the newest flagship; it shares Opus's capability shape, so it
+  // donates flags from the SDK `default` (flagship) template via family "opus".
+  { value: "fable", displayName: "Fable 5", description: "Fable 5", family: "opus" },
   {
     value: "opus[1m]",
     displayName: "Opus 4.8 1M",
@@ -4318,7 +4653,11 @@ export function buildForkModelList(sdkModels: ModelInfo[]): ModelInfo[] {
  * - The Default option is unaffected by `availableModels` — it always remains
  *   available, even when the allowlist is `[]`.
  */
-function applyAvailableModelsAllowlist(sdkModels: ModelInfo[], allowlist: string[]): ModelInfo[] {
+export function applyAvailableModelsAllowlist(
+  sdkModels: ModelInfo[],
+  allowlist: string[],
+  settingsModelOverrides?: Record<string, string>,
+): ModelInfo[] {
   // Default is always preserved per the docs. Synthesize one if the SDK
   // didn't surface it so downstream code (e.g. `getAvailableModels` picking
   // `models[0]` as a fallback) still has something to work with.
@@ -4332,17 +4671,28 @@ function applyAvailableModelsAllowlist(sdkModels: ModelInfo[], allowlist: string
 
   const sdkModelsWithoutDefault = sdkModels.filter((m) => m.value !== "default");
 
+  // Bedrock/Vertex deployments enforce short aliases (e.g. "claude-opus-4-6")
+  // in availableModels but require provider-specific IDs at the API. We still
+  // resolve `sdkMatch` against the alias (`trimmed`) — that's what the
+  // matching heuristics above are built for, and override targets (ARNs,
+  // opaque provider IDs) often won't textually resemble anything in
+  // `sdkModelsWithoutDefault`. Only the entry's surfaced `value` becomes the
+  // override target, so it's what `setModel` ends up passing to the API.
   for (const entry of allowlist) {
     const trimmed = entry.trim();
     if (!trimmed || seen.has(trimmed)) continue;
 
+    const overridden = settingsModelOverrides?.[trimmed];
+    const effective = overridden ?? trimmed;
+    if (seen.has(effective)) continue;
+
     const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
     if (sdkMatch) {
-      result.push({ ...sdkMatch, value: trimmed });
+      result.push({ ...sdkMatch, value: effective });
     } else {
-      result.push({ value: trimmed, displayName: trimmed, description: "" });
+      result.push({ value: effective, displayName: trimmed, description: "" });
     }
-    seen.add(trimmed);
+    seen.add(effective);
   }
 
   // The custom model option (ANTHROPIC_CUSTOM_MODEL_OPTION) is exempt from the
@@ -4610,6 +4960,64 @@ function applyMessageId(
   }
 }
 
+/** Built-in tools that drive the task list (headless/SDK sessions use these
+ *  instead of TodoWrite). Their tool_use/tool_result are surfaced as `plan`
+ *  snapshots rather than as tool_calls. */
+function isTaskTool(toolName: string): boolean {
+  return (
+    toolName === "TaskCreate" ||
+    toolName === "TaskUpdate" ||
+    toolName === "TaskList" ||
+    toolName === "TaskGet"
+  );
+}
+
+/** Whether a tool's tool_use surfaces to the client as a standalone
+ *  `tool_call`. TodoWrite is rendered as a `plan` and Task* tools are
+ *  suppressed (their plan snapshot is emitted at tool_result time), so neither
+ *  produces a tool_call. */
+function shouldEmitToolCall(toolName: string): boolean {
+  return toolName !== "TodoWrite" && !isTaskTool(toolName);
+}
+
+/** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
+ *  notification for a tool_use. Shared by every site that surfaces a tool call:
+ *  the streamed tool_use path (first encounter → tool_call, later encounter →
+ *  refine) and the permission flow (`ensureToolCallEmitted`), so they can't
+ *  drift. The initial `tool_call` carries `status: "pending"` and, for Bash, the
+ *  `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
+ *  updates key off of; a refining `tool_call_update` carries neither. */
+function toolCallNotification(
+  toolUse: { id: string; name: string; input: unknown },
+  rawInput: unknown,
+  supportsTerminalOutput: boolean,
+  cwd?: string,
+  refine = false,
+): SessionNotification["update"] {
+  if (refine) {
+    return {
+      _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+      toolCallId: toolUse.id,
+      sessionUpdate: "tool_call_update",
+      rawInput,
+      ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
+    };
+  }
+  return {
+    _meta: {
+      claudeCode: { toolName: toolUse.name },
+      ...(toolUse.name === "Bash" && supportsTerminalOutput
+        ? { terminal_info: { terminal_id: toolUse.id } }
+        : {}),
+    } satisfies ToolUpdateMeta,
+    toolCallId: toolUse.id,
+    sessionUpdate: "tool_call",
+    rawInput,
+    status: "pending",
+    ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
+  };
+}
+
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -4628,6 +5036,13 @@ export function toAcpNotifications(
     fileEditInterceptor?: FileEditInterceptor;
     cwd?: string;
     taskState?: TaskState;
+    // Tracks tool_use ids already emitted as a `tool_call` so a permission
+    // request (which emits the tool_call eagerly) and the streamed tool_use
+    // chunk don't both emit one — whichever arrives second emits a
+    // `tool_call_update` instead. Mutated in place. When omitted, the
+    // tool_call/update decision falls back to `toolUseCache` presence (the
+    // historical single-source behavior).
+    emittedToolCalls?: Set<string>;
     // Opaque id identifying the message these chunks belong to (ACP message ids
     // are opaque strings — no particular format is required). Attached to
     // user/agent message and thought chunks so clients can group streamed chunks
@@ -4715,12 +5130,7 @@ export function toAcpNotifications(
               entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
             };
           }
-        } else if (
-          chunk.name === "TaskCreate" ||
-          chunk.name === "TaskUpdate" ||
-          chunk.name === "TaskList" ||
-          chunk.name === "TaskGet"
-        ) {
+        } else if (isTaskTool(chunk.name)) {
           // Task* tool_use is suppressed; the plan update is emitted at
           // tool_result time once we have the task ID (for TaskCreate) and
           // confirmation that the change took effect.
@@ -4788,39 +5198,31 @@ export function toAcpNotifications(
             // ignore if we can't turn it to JSON
           }
 
-          if (alreadyCached) {
-            // Second encounter (full assistant message after streaming) —
-            // send as tool_call_update to refine the existing tool_call
-            // rather than emitting a duplicate tool_call.
-            update = {
-              _meta: {
-                claudeCode: {
-                  toolName: chunk.name,
-                },
-              } satisfies ToolUpdateMeta,
-              toolCallId: chunk.id,
-              sessionUpdate: "tool_call_update",
+          // Emit a `tool_call` only the first time this id surfaces to the
+          // client; afterwards refine it with a `tool_call_update`. The first
+          // surface may be this stream chunk OR an earlier permission request
+          // (see `ensureToolCallEmitted`), so emission is tracked separately
+          // from `toolUseCache`. Without an `emittedToolCalls` set we fall back
+          // to cache presence — the historical streaming-only behavior.
+          const emittedToolCalls = options?.emittedToolCalls;
+          const alreadyEmitted = emittedToolCalls ? emittedToolCalls.has(chunk.id) : alreadyCached;
+          emittedToolCalls?.add(chunk.id);
+
+          if (alreadyEmitted) {
+            // Already surfaced (full assistant message after streaming, or a
+            // permission request emitted it first) — refine with a
+            // tool_call_update rather than emitting a duplicate tool_call.
+            update = toolCallNotification(
+              chunk,
               rawInput,
-              ...toolInfoFromToolUse(chunk, supportsTerminalOutput, options?.cwd),
-            };
+              supportsTerminalOutput,
+              options?.cwd,
+              true,
+            );
           } else {
-            // First encounter (streaming content_block_start or replay) —
-            // send as tool_call with terminal_info for Bash tools.
-            update = {
-              _meta: {
-                claudeCode: {
-                  toolName: chunk.name,
-                },
-                ...(chunk.name === "Bash" && supportsTerminalOutput
-                  ? { terminal_info: { terminal_id: chunk.id } }
-                  : {}),
-              } satisfies ToolUpdateMeta,
-              toolCallId: chunk.id,
-              sessionUpdate: "tool_call",
-              rawInput,
-              status: "pending",
-              ...toolInfoFromToolUse(chunk, supportsTerminalOutput, options?.cwd),
-            };
+            // First surface (streaming content_block_start or replay) — send as
+            // tool_call (with terminal_info for Bash).
+            update = toolCallNotification(chunk, rawInput, supportsTerminalOutput, options?.cwd);
           }
         }
         break;
@@ -4834,6 +5236,7 @@ export function toAcpNotifications(
       case "bash_code_execution_tool_result":
       case "text_editor_code_execution_tool_result":
       case "mcp_tool_result": {
+        options?.emittedToolCalls?.delete(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
           logger.error(
@@ -4842,12 +5245,7 @@ export function toAcpNotifications(
           break;
         }
 
-        if (
-          toolUse.name === "TaskCreate" ||
-          toolUse.name === "TaskUpdate" ||
-          toolUse.name === "TaskList" ||
-          toolUse.name === "TaskGet"
-        ) {
+        if (isTaskTool(toolUse.name)) {
           // Headless/SDK sessions emit Task* tools instead of TodoWrite.
           // TaskCreate / TaskUpdate mutate the accumulated task list; TaskList
           // and TaskGet are read-only so we just suppress their tool_call /
@@ -4968,6 +5366,7 @@ export function streamEventToAcpNotifications(
     fileEditInterceptor?: FileEditInterceptor;
     cwd?: string;
     taskState?: TaskState;
+    emittedToolCalls?: Set<string>;
     messageId?: string;
   },
 ): SessionNotification[] {
@@ -4987,6 +5386,7 @@ export function streamEventToAcpNotifications(
           fileEditInterceptor: options?.fileEditInterceptor,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          emittedToolCalls: options?.emittedToolCalls,
           messageId: options?.messageId,
         },
       );
@@ -5004,6 +5404,7 @@ export function streamEventToAcpNotifications(
           fileEditInterceptor: options?.fileEditInterceptor,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          emittedToolCalls: options?.emittedToolCalls,
           messageId: options?.messageId,
         },
       );
@@ -5084,6 +5485,7 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
+    .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )

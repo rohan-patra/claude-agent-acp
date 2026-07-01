@@ -40,6 +40,7 @@ describe("buildForkModelList", () => {
   it("surfaces the full Claude Code picker in order, replacing the SDK's 4-model list", () => {
     const models = buildForkModelList(SDK_MODELS);
     expect(models.map((m) => [m.value, m.displayName])).toEqual([
+      ["fable", "Fable 5"],
       ["opus[1m]", "Opus 4.8 1M"],
       ["opus", "Opus 4.8"],
       ["claude-opus-4-7[1m]", "Opus 4.7 1M"],
