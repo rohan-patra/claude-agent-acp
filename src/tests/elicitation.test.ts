@@ -11,7 +11,10 @@ import {
   AskUserQuestion,
   createElicitationResponseToElicitResult,
   extractAskUserQuestions,
+  extractRefusalFallbackPrompt,
   mcpElicitationToCreateRequest,
+  refusalFallbackResultFromResponse,
+  refusalFallbackToCreateRequest,
 } from "../elicitation.js";
 
 const SESSION_ID = "session-1";
@@ -19,7 +22,7 @@ const SESSION_ID = "session-1";
 /**
  * Build a question matching the SDK's (strict) AskUserQuestion schema while
  * keeping test sites terse. Option descriptions default to "" (the tool always
- * provides one); pass a description to exercise the "label — description" title.
+ * provides one); pass a description to exercise the enum option's description.
  */
 function mkQuestion(
   question: string,
@@ -124,6 +127,14 @@ describe("createElicitationResponseToElicitResult", () => {
       createElicitationResponseToElicitResult({ action: "cancel" } as CreateElicitationResponse),
     ).toEqual({ action: "cancel" });
   });
+
+  it("maps a custom/future action to cancel", () => {
+    expect(
+      createElicitationResponseToElicitResult({
+        action: "_zed/snooze",
+      } as CreateElicitationResponse),
+    ).toEqual({ action: "cancel" });
+  });
 });
 
 describe("extractAskUserQuestions", () => {
@@ -187,14 +198,10 @@ describe("askUserQuestionsToCreateRequest", () => {
       title: "Library",
       description: undefined,
       oneOf: [
-        {
-          const: "date-fns",
-          title: "date-fns — Lightweight",
-          // Structured description forwarded under `_meta` so clients can render
-          // it as secondary text instead of parsing it out of the title.
-          _meta: { "_claude/askUserQuestionOption": { description: "Lightweight" } },
-        },
-        // No description → no `_meta` emitted.
+        // The description travels in the enum option's first-class field; the
+        // title stays the clean label (no "label — description" flattening).
+        { const: "date-fns", title: "date-fns", description: "Lightweight" },
+        // No description → the field is omitted entirely.
         { const: "luxon", title: "luxon" },
       ],
     });
@@ -202,7 +209,7 @@ describe("askUserQuestionsToCreateRequest", () => {
     expect(schema.properties?.["Which library?"]).toBeUndefined();
   });
 
-  it("forwards option description and preview under _meta for rich clients", () => {
+  it("carries descriptions structurally and forwards previews under _meta", () => {
     const questions = [
       mkQuestion("Which layout?", [
         {
@@ -223,24 +230,22 @@ describe("askUserQuestionsToCreateRequest", () => {
     ).requestedSchema;
     const oneOf = (schema.properties?.["question_0"] as { oneOf: EnumOption[] }).oneOf;
 
-    // Both description and preview travel structurally; the title still flattens
-    // the description for clients that only read const/title.
+    // The description uses the enum option's own field; only the preview —
+    // which still has no structural slot — rides under `_meta`.
     expect(oneOf[0]).toEqual({
       const: "Grid",
-      title: "Grid — Cards in a responsive grid",
+      title: "Grid",
+      description: "Cards in a responsive grid",
       _meta: {
         "_claude/askUserQuestionOption": {
-          description: "Cards in a responsive grid",
           preview: "```\n[ ] [ ] [ ]\n[ ] [ ] [ ]\n```",
         },
       },
     });
-    // Description only → preview omitted from _meta.
-    expect(oneOf[1]._meta).toEqual({
-      "_claude/askUserQuestionOption": { description: "Stacked rows" },
-    });
-    // Neither → no _meta at all.
-    expect(oneOf[2]._meta).toBeUndefined();
+    // Description only → no _meta needed.
+    expect(oneOf[1]).toEqual({ const: "List", title: "List", description: "Stacked rows" });
+    // Neither → just the label.
+    expect(oneOf[2]).toEqual({ const: "Plain", title: "Plain" });
   });
 
   it("includes a per-question optional free-text custom-answer field", () => {
@@ -376,6 +381,13 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
+  it("returns cancel for a custom/future action it does not understand", () => {
+    const response = { action: "_zed/snooze" } as CreateElicitationResponse;
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "cancel",
+    });
+  });
+
   it("omits answers for questions the user left unanswered", () => {
     const response = {
       action: "accept",
@@ -387,5 +399,106 @@ describe("applyAskElicitationResponse", () => {
     expect((result as Extract<typeof result, { action: "answered" }>).updatedInput.answers).toEqual(
       { "Single?": "B" },
     );
+  });
+});
+
+describe("extractRefusalFallbackPrompt", () => {
+  it("extracts required and optional fields", () => {
+    expect(
+      extractRefusalFallbackPrompt({
+        originalModel: "claude-fable-5",
+        fallbackModel: "claude-opus-4-8",
+        apiRefusalCategory: "cyber",
+        guidanceText: "You can retry with the fallback model.",
+        retractedMessageUuids: ["u1"],
+      }),
+    ).toEqual({
+      originalModel: "claude-fable-5",
+      fallbackModel: "claude-opus-4-8",
+      apiRefusalCategory: "cyber",
+      guidanceText: "You can retry with the fallback model.",
+    });
+  });
+
+  it("returns null when a required model field is missing or mistyped", () => {
+    expect(extractRefusalFallbackPrompt({ fallbackModel: "claude-opus-4-8" })).toBeNull();
+    expect(
+      extractRefusalFallbackPrompt({ originalModel: 5, fallbackModel: "claude-opus-4-8" }),
+    ).toBeNull();
+  });
+
+  it("normalizes a non-string category to null and drops empty guidance", () => {
+    expect(
+      extractRefusalFallbackPrompt({
+        originalModel: "a",
+        fallbackModel: "b",
+        apiRefusalCategory: null,
+        guidanceText: "",
+      }),
+    ).toEqual({ originalModel: "a", fallbackModel: "b", apiRefusalCategory: null });
+  });
+});
+
+describe("refusalFallbackToCreateRequest", () => {
+  const prompt = {
+    originalModel: "claude-fable-5",
+    fallbackModel: "claude-opus-4-8",
+    apiRefusalCategory: "cyber" as string | null,
+  };
+
+  it("builds a single-choice form whose enum consts are the dialog's wire results", () => {
+    const request = refusalFallbackToCreateRequest(prompt, SESSION_ID) as Extract<
+      CreateElicitationRequest,
+      { mode: "form" }
+    >;
+    expect(request.mode).toBe("form");
+    expect(request).toMatchObject({ sessionId: SESSION_ID });
+    expect(request.message).toContain("claude-fable-5");
+    expect(request.message).toContain("(cyber)");
+    expect(request.message).toContain("claude-opus-4-8");
+
+    const choice = request.requestedSchema.properties?.choice as {
+      type: string;
+      oneOf: Array<{ const: string; title: string; description?: string }>;
+    };
+    expect(choice.type).toBe("string");
+    expect(choice.oneOf.map((o) => o.const)).toEqual(["retry_fallback", "cancelled"]);
+    expect(choice.oneOf[0].title).toContain("claude-opus-4-8");
+    // Each option explains its consequence in the description field.
+    expect(choice.oneOf[0].description).toContain("claude-opus-4-8");
+    expect(choice.oneOf[1].description).toBeTruthy();
+  });
+
+  it("omits the category marker and appends guidance when provided", () => {
+    const request = refusalFallbackToCreateRequest(
+      { ...prompt, apiRefusalCategory: null, guidanceText: "Consider rephrasing." },
+      SESSION_ID,
+    );
+    expect(request.message).not.toContain("(");
+    expect(request.message).toContain("Consider rephrasing.");
+  });
+});
+
+describe("refusalFallbackResultFromResponse", () => {
+  it("maps an accepted retry choice to retry_fallback", () => {
+    const response = {
+      action: "accept",
+      content: { choice: "retry_fallback" },
+    } as CreateElicitationResponse;
+    expect(refusalFallbackResultFromResponse(response)).toBe("retry_fallback");
+  });
+
+  it("keeps the refusal for every other outcome", () => {
+    const cases = [
+      { action: "accept", content: { choice: "cancelled" } },
+      { action: "accept", content: {} },
+      { action: "accept", content: { choice: "something-new" } },
+      { action: "accept" },
+      { action: "decline" },
+      { action: "cancel" },
+    ] as CreateElicitationResponse[];
+    for (const response of cases) {
+      expect(refusalFallbackResultFromResponse(response)).toBe("cancelled");
+    }
   });
 });
