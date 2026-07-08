@@ -82,6 +82,17 @@ function userEcho(u: any) {
   };
 }
 
+/** The `usage` a cancelled active turn settles with when the cancel pre-empted
+ *  its result: all zeros, since only a turn's terminal result feeds the
+ *  accumulator (issue #844). */
+const cancelledTurnUsage = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cachedReadTokens: 0,
+  cachedWriteTokens: 0,
+  totalTokens: 0,
+};
+
 /** Wrap a mock async generator with the `Query` methods the agent calls outside
  *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
  *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
@@ -209,9 +220,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       params: CreateElicitationRequest,
     ): Promise<CreateElicitationResponse> {
       this.elicitations.push(params);
-      // The `in` check also excludes the custom/future-mode variant, whose
-      // `mode: string` would otherwise survive the literal comparison.
-      if (params.mode !== "form" || !("requestedSchema" in params)) {
+      if (!CreateElicitationRequest.isForm(params)) {
         return { action: "decline" };
       }
       // Accept the first option of every choice field (skip the free-text one).
@@ -442,10 +451,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     // ...built by our converter (indexed field key + free-text "Other" field),
     // which confirms our interception path produced it rather than some other
     // mechanism.
-    const properties =
-      elicitation.mode === "form" && "requestedSchema" in elicitation
-        ? Object.keys(elicitation.requestedSchema.properties ?? {})
-        : [];
+    const properties = CreateElicitationRequest.isForm(elicitation)
+      ? Object.keys(elicitation.requestedSchema.properties ?? {})
+      : [];
     expect(properties).toContain("question_0");
     expect(properties).toContain("question_0_custom");
 
@@ -4825,6 +4833,22 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual(["real answer"]);
   });
 
+  it("dedupes a streamed text block even when a thinking delta omits text", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      messageStart("msg-missing-thinking"),
+      thinkingDelta(undefined as any),
+      textDelta("real answer"),
+      assistantMessage("msg-missing-thinking", [{ type: "text", text: "real answer" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["real answer"]);
+  });
+
   it("does not re-emit the next turn's text after a turn is cancelled mid-stream", async () => {
     // Regression: streamedBlocks is reset inside the consolidated-assistant
     // branch, but a cancelled turn `break`s out before reaching it (the
@@ -4880,7 +4904,10 @@ describe("assembled assistant text fallback", () => {
 
     await agent.cancel({ sessionId: "test-session" });
     releaseCancel();
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] });
 
@@ -5812,8 +5839,53 @@ describe("post-error recovery", () => {
       prompt: [{ type: "text", text: "second" }],
     });
 
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
+  it("exposes the accumulated usage on a cancelled turn's PromptResponse (issue #844)", async () => {
+    // The interrupted turn's result is dropped at the `session.cancelled`
+    // guard, but its usage was already accumulated — the cancelled settle must
+    // report it so clients metering token spend don't lose the round-trips
+    // that completed before the cancel.
+    const agent = createMockAgent();
+    let releaseAfterCancel!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        await afterCancel; // wait until the test has cancelled turn 1
+        // The interrupt still yields the turn's result (usage 10/5) before the
+        // trailing idle that settles it cancelled.
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.cancel({ sessionId: "test-session" });
+    releaseAfterCancel();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+        totalTokens: 15,
+      },
+    });
   });
 
   it("ignores cancel() after the query stream has closed (no interrupt on a dead query)", async () => {
@@ -5914,7 +5986,10 @@ describe("post-error recovery", () => {
 
     releaseEnd(); // stream ends -> done branch settles turn 1 + rejects turn 2
 
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
     await expect(second).rejects.toThrow(/start a new session/);
   });
 
@@ -5955,7 +6030,10 @@ describe("post-error recovery", () => {
 
     await agent.cancel({ sessionId: "test-session" });
     releaseAfterCancel();
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
 
     // session.cancelled is still true here (turn 1 settled, nothing re-activated).
     // The /compact result must still settle via head-promotion.
@@ -6018,7 +6096,12 @@ describe("post-error recovery", () => {
     });
     afterCancelAndQueue();
 
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    // Turn 1 ran (and was cancelled mid-flight) so it reports its usage;
+    // turn 2 never ran, so its cancelled settle carries none.
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const thirdResult = await third;
     expect(thirdResult.stopReason).toBe("end_turn");
@@ -6086,7 +6169,10 @@ describe("post-error recovery", () => {
     });
     release();
 
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
     expect(compactResult.stopReason).toBe("end_turn");
@@ -6258,7 +6344,10 @@ describe("session/cancel wedge recovery (issue #680)", () => {
 
     // Clean up the wedged prompt + long timer.
     await agent.closeSession({ sessionId: "test-session" });
-    await expect(promptPromise).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(promptPromise).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
   });
 
   it("resolves an in-flight wedged prompt immediately when the session is closed", async () => {
@@ -6277,7 +6366,10 @@ describe("session/cancel wedge recovery (issue #680)", () => {
 
     await agent.closeSession({ sessionId: "test-session" });
 
-    await expect(promptPromise).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(promptPromise).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
     expect(agent.sessions["test-session"]).toBeUndefined();
   });
 });
@@ -6395,7 +6487,10 @@ describe("turn abandoned by the SDK (issue #825)", () => {
       prompt: [{ type: "text", text: "second" }],
     });
 
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
     const secondResult = await second;
     expect(secondResult.stopReason).toBe("end_turn");
     expect(secondResult.usage?.inputTokens).toBe(10);
@@ -6441,7 +6536,10 @@ describe("turn abandoned by the SDK (issue #825)", () => {
     await agent.cancel({ sessionId: "test-session" });
     releaseAfterCancel();
 
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const third = await agent.prompt({
       sessionId: "test-session",
@@ -6486,7 +6584,10 @@ describe("turn abandoned by the SDK (issue #825)", () => {
     });
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
     await agent.cancel({ sessionId: "test-session" }); // backstop (10ms) settles turn 1
-    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
 
     // Queue turn 2 BEFORE the SDK recovers, so the stale result races it.
     const second = agent.prompt({
@@ -6726,6 +6827,36 @@ describe("toAcpNotifications thinking chunks", () => {
   it("skips empty thinking deltas", () => {
     const result = toAcpNotifications(
       [{ type: "thinking_delta", thinking: "", estimated_tokens: 0 }],
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it("skips thinking chunks without string content", () => {
+    const result = toAcpNotifications(
+      [
+        { type: "thinking", signature: "abc" },
+        { type: "thinking_delta", estimated_tokens: 0 },
+        { type: "thinking_delta", thinking: null, estimated_tokens: 0 },
+      ] as any,
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it("skips text deltas without string content", () => {
+    const result = toAcpNotifications(
+      [{ type: "text_delta" }, { type: "text_delta", text: null }] as any,
       "assistant",
       "test",
       {},
