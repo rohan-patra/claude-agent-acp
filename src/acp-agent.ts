@@ -5145,7 +5145,13 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
     description: "Opus 4.6 with 1M context",
     family: "opus",
   },
-  { value: "sonnet", displayName: "Sonnet 4.6", description: "Sonnet 4.6", family: "sonnet" },
+  { value: "sonnet", displayName: "Sonnet 5", description: "Sonnet 5", family: "sonnet" },
+  {
+    value: "claude-sonnet-4-6",
+    displayName: "Sonnet 4.6",
+    description: "Sonnet 4.6",
+    family: "sonnet",
+  },
   { value: "haiku", displayName: "Haiku 4.5", description: "Haiku 4.5", family: "haiku" },
 ];
 
