@@ -557,11 +557,10 @@ describe("ClaudeAcpAgent settings", () => {
       expect(modelOption.options.map((o: any) => o.value)).toEqual([
         "fable",
         "opus[1m]",
-        "opus",
         "claude-opus-4-7[1m]",
-        "claude-opus-4-7",
         "claude-opus-4-6[1m]",
         "sonnet",
+        "claude-sonnet-4-6",
         "haiku",
       ]);
     });
@@ -936,9 +935,9 @@ describe("ClaudeAcpAgent settings", () => {
     // setModel call would be a redundant round-trip (and on some launcher
     // setups, more fragile than launch-time selection).
     const originalEnv = process.env.ANTHROPIC_MODEL;
-    // `claude-opus-4-7` is a verbatim entry in the fork picker, and the SDK
+    // `claude-opus-4-7[1m]` is a verbatim entry in the fork picker, and the SDK
     // mock below also surfaces it, so the skip-setModel optimization applies.
-    process.env.ANTHROPIC_MODEL = "claude-opus-4-7";
+    process.env.ANTHROPIC_MODEL = "claude-opus-4-7[1m]";
 
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });
@@ -950,7 +949,7 @@ describe("ClaudeAcpAgent settings", () => {
           models: [
             { value: "default", displayName: "Default", description: "" },
             { value: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", description: "" },
-            { value: "claude-opus-4-7", displayName: "Claude Opus 4.7", description: "" },
+            { value: "claude-opus-4-7[1m]", displayName: "Claude Opus 4.7 1M", description: "" },
           ],
         }),
         setModel: setModelSpy,
@@ -970,7 +969,7 @@ describe("ClaudeAcpAgent settings", () => {
 
       expect(setModelSpy).not.toHaveBeenCalled();
       expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
-        "claude-opus-4-7",
+        "claude-opus-4-7[1m]",
       );
     } finally {
       if (originalEnv === undefined) {

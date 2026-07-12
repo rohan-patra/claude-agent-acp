@@ -42,24 +42,17 @@ describe("buildForkModelList", () => {
     expect(models.map((m) => [m.value, m.displayName])).toEqual([
       ["fable", "Fable 5"],
       ["opus[1m]", "Opus 4.8 1M"],
-      ["opus", "Opus 4.8"],
       ["claude-opus-4-7[1m]", "Opus 4.7 1M"],
-      ["claude-opus-4-7", "Opus 4.7"],
       ["claude-opus-4-6[1m]", "Opus 4.6 1M"],
-      ["sonnet", "Sonnet 4.6"],
+      ["sonnet", "Sonnet 5"],
+      ["claude-sonnet-4-6", "Sonnet 4.6"],
       ["haiku", "Haiku 4.5"],
     ]);
   });
 
   it("donates Opus capability flags from the SDK `default` template to every Opus entry", () => {
     const models = buildForkModelList(SDK_MODELS);
-    for (const value of [
-      "opus[1m]",
-      "opus",
-      "claude-opus-4-7[1m]",
-      "claude-opus-4-7",
-      "claude-opus-4-6[1m]",
-    ]) {
+    for (const value of ["opus[1m]", "claude-opus-4-7[1m]", "claude-opus-4-6[1m]"]) {
       const m = models.find((x) => x.value === value)!;
       expect(m.supportsEffort).toBe(true);
       expect(m.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
@@ -105,7 +98,7 @@ describe("buildForkModelList", () => {
       },
     ];
     const models = buildForkModelList(opusOnly);
-    const opus = models.find((m) => m.value === "opus")!;
+    const opus = models.find((m) => m.value === "opus[1m]")!;
     // Picked up the opus-matching template, not the baked fallback.
     expect(opus.supportedEffortLevels).toEqual(["low", "high"]);
   });

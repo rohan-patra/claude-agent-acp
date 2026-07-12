@@ -1,6 +1,7 @@
 import {
   ContentBlock,
   PlanEntry,
+  SessionNotification,
   ToolCallContent,
   ToolCallLocation,
   ToolKind,
@@ -1187,3 +1188,108 @@ export const createTaskHook =
     }
     return { continue: true };
   };
+
+// ---------------------------------------------------------------------------
+// Background-task visibility (fork addition)
+//
+// The SDK ends the ACP turn (result → end_turn) when a foreground model
+// invocation finishes, but background subagents / Bash / monitors / workflows
+// keep running afterward. Rather than distort the turn boundary, we surface the
+// ongoing work: the spawning tool-call card is held `in_progress` and finalized
+// late (see `suppressBackgroundToolResults` + the consumer's finalize path), and
+// each backgrounded task is mirrored into the ACP plan (see the *PlanEntries
+// helpers). This relies on Zed rendering behavior documented in CLAUDE.md
+// ("Background-Task Visibility" → "If Zed changes behavior").
+// ---------------------------------------------------------------------------
+
+/**
+ * A live background task (subagent, background Bash, monitor, or workflow) that
+ * outlives the ACP turn that spawned it. Assembled from `task_started` (which
+ * carries `tool_use_id`, type, description, and `skip_transcript`) and refined
+ * by the REPLACE-semantics `background_tasks_changed` level signal (the
+ * authority on whether the task is actually backgrounded). Removed on a terminal
+ * `task_notification`/`task_updated`.
+ */
+export type RunningTask = {
+  taskId: string;
+  /**
+   * tool_use id of the spawning Agent/Task/Bash call — the ACP tool-card id we
+   * hold `in_progress` and finalize when the task settles. Absent when the task
+   * was first seen via `background_tasks_changed` (ids-only) before its
+   * `task_started` edge; without it the card can't be finalized.
+   */
+  toolUseId?: string;
+  /** "subagent" | "shell" | "monitor" | "workflow" | raw task_type. */
+  type: string;
+  /** agent_type for subagent tasks (used in the plan label). */
+  subagentType?: string;
+  description: string;
+  /** Ambient/housekeeping task — hidden from the plan (SDK `skip_transcript`). */
+  skipTranscript: boolean;
+  /**
+   * True once the task appears in a `background_tasks_changed` payload (or a
+   * `task_updated` patch with `is_backgrounded`). Gates plan visibility so a
+   * foreground subagent's transient entry never flashes into the plan.
+   */
+  backgrounded: boolean;
+};
+
+/** Human-readable plan-row label for a running task. */
+export function runningTaskLabel(task: RunningTask): string {
+  if (task.type === "subagent") return `subagent: ${task.subagentType ?? task.description}`;
+  if (task.type === "shell") return `shell: ${task.description}`;
+  return task.description || task.type;
+}
+
+/** Plan entries for the backgrounded, non-ambient running tasks only. */
+export function runningTaskPlanEntries(
+  runningTasks: ReadonlyMap<string, RunningTask>,
+): PlanEntry[] {
+  const out: PlanEntry[] = [];
+  for (const task of runningTasks.values()) {
+    if (!task.backgrounded || task.skipTranscript) continue;
+    out.push({ content: runningTaskLabel(task), status: "in_progress", priority: "medium" });
+  }
+  return out;
+}
+
+/**
+ * Sole producer of ACP plan entries: real todos (`taskState`) unioned with one
+ * `in_progress` row per backgrounded running task. A settled task drops out the
+ * instant it leaves `runningTasks`. Route every `sessionUpdate: "plan"` emit
+ * through this so a todos-only emit can't clobber the running-task rows.
+ */
+export function buildMergedPlanEntries(
+  taskState: TaskState,
+  runningTasks: ReadonlyMap<string, RunningTask>,
+): PlanEntry[] {
+  return [...taskStateToPlanEntries(taskState), ...runningTaskPlanEntries(runningTasks)];
+}
+
+/**
+ * Rewrite terminal `tool_call_update` statuses to `in_progress` for cards whose
+ * tool_use spawned a still-running background task, so the card keeps spinning
+ * until the task's own terminal event finalizes it. Pure; returns the input
+ * array unchanged (same reference) when nothing matches.
+ */
+export function suppressBackgroundToolResults(
+  notifications: SessionNotification[],
+  runningTaskByToolUseId: ReadonlyMap<string, string>,
+): SessionNotification[] {
+  if (runningTaskByToolUseId.size === 0) return notifications;
+  let changed = false;
+  const mapped = notifications.map((notification) => {
+    const update = notification.update;
+    if (
+      update.sessionUpdate === "tool_call_update" &&
+      typeof update.toolCallId === "string" &&
+      runningTaskByToolUseId.has(update.toolCallId) &&
+      (update.status === "completed" || update.status === "failed")
+    ) {
+      changed = true;
+      return { ...notification, update: { ...update, status: "in_progress" as const } };
+    }
+    return notification;
+  });
+  return changed ? mapped : notifications;
+}

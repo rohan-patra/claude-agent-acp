@@ -39,13 +39,13 @@ In v0.18.0 ([PR #316](https://github.com/zed-industries/claude-agent-acp/pull/31
 
 This fork fixes all of those by using a PostToolUse intercept instead of an MCP server:
 
-| Decision | Rationale |
-|----------|-----------|
-| **PostToolUse intercept, not MCP** | Built-in tools work everywhere (main session + subagents). No MCP tool access issues. |
-| **Write/Edit only** (no Read, no Bash) | Read works fine built-in. Only write operations need ACP routing for the Review UI. |
-| **Read-before-edit cache** | Files are cached when Read completes. Cache is used for reverting to the pre-edit state. Consecutive edits work without re-reading. |
-| **No system prompt or PreToolUse hook** | Claude uses its built-in tools naturally. No tool redirection needed. |
-| **No custom permissions** | Relies on Claude Code's built-in `canUseTool` and settings files. |
+| Decision                                | Rationale                                                                                                                           |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **PostToolUse intercept, not MCP**      | Built-in tools work everywhere (main session + subagents). No MCP tool access issues.                                               |
+| **Write/Edit only** (no Read, no Bash)  | Read works fine built-in. Only write operations need ACP routing for the Review UI.                                                 |
+| **Read-before-edit cache**              | Files are cached when Read completes. Cache is used for reverting to the pre-edit state. Consecutive edits work without re-reading. |
+| **No system prompt or PreToolUse hook** | Claude uses its built-in tools naturally. No tool redirection needed.                                                               |
+| **No custom permissions**               | Relies on Claude Code's built-in `canUseTool` and settings files.                                                                   |
 
 ## Setup
 
@@ -106,6 +106,10 @@ The main feature. When Claude edits or creates a file, the change appears in Zed
 - **`.context/` bypass** — Files inside `.context/` are written directly to disk without the review UI, since these are internal working files (plans, etc.) that shouldn't require manual approval.
 - **Safe fallback** — If ACP routing fails, the new content is restored to disk so the edit isn't lost. Uncached files (never explicitly Read) skip the revert step.
 
+### Background-Task Visibility
+
+When Claude spawns background work (subagents, Bash jobs, monitors, workflows) or defers tool calls, the work continues past the ACP turn boundary. Instead of unlocking the composer while Claude is still working, this fork keeps work visible: tool cards stay spinning until the background task completes, running tasks appear in the plan panel as in-progress entries, and the turn doesn't settle until the authoritative `idle` signal (not just the first `result`). This prevents the confusing "your turn" state when the agent is still busy.
+
 ### `.context` Directory
 
 Plan files and other context artifacts are stored in `.context/` within the project directory instead of `~/.claude/plans/`.
@@ -145,6 +149,7 @@ See [CLAUDE.md](./CLAUDE.md) for details on the patch and how to track newer SDK
 ### All Upstream Features
 
 Everything else works unchanged:
+
 - Context @-mentions and images
 - Tool calls with permission requests
 - Interactive and background terminals
@@ -165,12 +170,12 @@ npm run test:integration  # Integration tests (requires RUN_INTEGRATION_TESTS=tr
 
 This fork is designed for easy merges. All changes are additive:
 
-| File | Change | Merge notes |
-|------|--------|-------------|
-| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, session config options for effort/fast mode, `.context` git-exclude on session creation, `plansDirectory` setting | All changes are purely additive insertion blocks |
-| `src/tools.ts` | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook`, `.context/` bypass in interceptor | Additions at end of file; shouldn't conflict |
-| `src/lib.ts` | 2 export lines (`createFileEditInterceptor`, `FileEditInterceptor` type) | Re-add if upstream changes exports |
-| `package.json` | `@anthropic-ai/claude-agent-sdk` repointed to the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`) | Keep our git spec on merge — don't accept upstream's npm version; bump the SHA to track a newer SDK. For lockfile conflicts on an SDK bump, `git checkout --theirs package-lock.json && npm install` resolves cleanly. See [CLAUDE.md](./CLAUDE.md) for the full SDK-bump procedure. |
+| File               | Change                                                                                                                                                                                                                                                                                                                                                                                       | Merge notes                                                                                                                                                                                                                                                                          |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/acp-agent.ts` | `FileEditInterceptor` creation + wiring in `createSession()`, forwarding in `toAcpNotifications`/`streamEventToAcpNotifications`, session config options for effort/fast mode, `.context` git-exclude on session creation, `plansDirectory` setting, background-task visibility (Session fields, consumer handlers, plan-combiner wiring, deferred-settlement logic in result/idle handlers) | All changes are purely additive insertion blocks; see CLAUDE.md for background-task merge notes                                                                                                                                                                                      |
+| `src/tools.ts`     | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook`, `.context/` bypass in interceptor, background-task helpers (`RunningTask`, `runningTaskLabel`, `runningTaskPlanEntries`, `buildMergedPlanEntries`, `suppressBackgroundToolResults`)           | Additions at end of file; shouldn't conflict; route new plan emits through the combiner                                                                                                                                                                                              |
+| `src/lib.ts`       | 2 export lines (`createFileEditInterceptor`, `FileEditInterceptor` type) + 5 new exports for background-task helpers                                                                                                                                                                                                                                                                         | Re-add if upstream changes exports                                                                                                                                                                                                                                                   |
+| `package.json`     | `@anthropic-ai/claude-agent-sdk` repointed to the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`)                                                                                                                                                                                                                                                                           | Keep our git spec on merge — don't accept upstream's npm version; bump the SHA to track a newer SDK. For lockfile conflicts on an SDK bump, `git checkout --theirs package-lock.json && npm install` resolves cleanly. See [CLAUDE.md](./CLAUDE.md) for the full SDK-bump procedure. |
 
 See [CLAUDE.md](./CLAUDE.md) for detailed merge instructions and architecture documentation.
 

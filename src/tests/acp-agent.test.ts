@@ -25,6 +25,11 @@ import {
   toDisplayPath,
   toolUpdateFromToolResult,
   toolUpdateFromDiffToolResponse,
+  type RunningTask,
+  buildMergedPlanEntries,
+  suppressBackgroundToolResults,
+  runningTaskPlanEntries,
+  type TaskState,
 } from "../tools.js";
 import {
   toAcpNotifications,
@@ -138,6 +143,9 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     emittedToolCalls: new Set(),
     subagentParentToolUseIds: new Map(),
     messageIdToUuid: new Map(),
+    // Fork-specific: background-task visibility (Feature A/B).
+    runningTasks: new Map(),
+    runningTaskByToolUseId: new Map(),
     ...overrides,
   } as any;
 }
@@ -3584,6 +3592,8 @@ describe("session/close", () => {
       emittedToolCalls: new Set(),
       subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
+      runningTasks: new Map(),
+      runningTaskByToolUseId: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -3676,6 +3686,8 @@ describe("session/delete", () => {
       emittedToolCalls: new Set(),
       subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
+      runningTasks: new Map(),
+      runningTaskByToolUseId: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -3785,6 +3797,8 @@ describe("getOrCreateSession param change detection", () => {
       emittedToolCalls: new Set(),
       subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
+      runningTasks: new Map(),
+      runningTaskByToolUseId: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -6027,6 +6041,8 @@ describe("post-error recovery", () => {
       emittedToolCalls: new Set(),
       subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
+      runningTasks: new Map(),
+      runningTaskByToolUseId: new Map(),
     };
     return { interrupt };
   }
@@ -6802,6 +6818,8 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       emittedToolCalls: new Set(),
       subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
+      runningTasks: new Map(),
+      runningTaskByToolUseId: new Map(),
     };
     return { interrupt };
   }
@@ -7565,6 +7583,8 @@ describe("agent selection config option", () => {
         emittedToolCalls: new Set(),
         subagentParentToolUseIds: new Map(),
         messageIdToUuid: new Map(),
+        runningTasks: new Map(),
+        runningTaskByToolUseId: new Map(),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };
     }
@@ -7622,6 +7642,629 @@ describe("agent selection config option", () => {
       expect(session.currentAgent).toBe("default");
       const agentOption = session.configOptions.find((o) => o.id === "agent");
       expect(agentOption?.currentValue).toBe("default");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Background-task visibility (fork feature: Feature A/B).
+//
+// A - the ACP tool card that spawned a still-running background task (a
+// backgrounded subagent, Bash, monitor, or workflow) stays `in_progress` even
+// after its `tool_result` lands, and only finalizes when the task's own
+// terminal edge (`task_notification` / a terminal `task_updated` patch)
+// fires. B - such tasks are also mirrored into the ACP plan panel (merged
+// with real TodoWrite/Task* todos) while they're marked `backgrounded`, and
+// drop out the instant they settle. See CLAUDE.md → "Background-Task
+// Visibility" and .context/plans/i-just-wanted-to-greedy-wirth.md.
+// ---------------------------------------------------------------------------
+describe("background-task visibility (Feature A/B)", () => {
+  /** A `task_started` system message. Mirrors the harness at ~2280, with an
+   *  overrides bag so tests can add `subagent_type`/`task_type`/etc. */
+  function taskStarted(taskId: string, toolUseId: string, overrides: Record<string, unknown> = {}) {
+    return {
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: toolUseId,
+      description: "Investigate",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...overrides,
+    };
+  }
+
+  /** The `type:"user"` message the SDK emits for a completed tool call: a
+   *  single `tool_result` content block keyed by `tool_use_id`, matching the
+   *  block shape the "subagent permission attribution" tests build inline
+   *  (e.g. ~2009) but as a full replayable session message. */
+  function toolResult(
+    toolUseId: string,
+    overrides: { is_error?: boolean; content?: unknown } = {},
+  ) {
+    return {
+      type: "user" as const,
+      message: {
+        role: "user" as const,
+        content: [
+          {
+            type: "tool_result" as const,
+            tool_use_id: toolUseId,
+            content: overrides.content ?? [{ type: "text", text: "ok" }],
+            ...(overrides.is_error !== undefined ? { is_error: overrides.is_error } : {}),
+          },
+        ],
+      },
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function successResult() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: null,
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** Replays the prompt's user echo (so the turn activates), then the given
+   *  messages, then settles the turn. Mirrors the harness at ~2319. */
+  function makeGenerator(messages: unknown[]) {
+    return async function* (input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield userEcho(userMessage);
+      }
+      yield* messages as any;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    };
+  }
+
+  /** A ClaudeAcpAgent whose client pushes every `sessionUpdate` notification
+   *  into `updates`, mirroring the capturing-client pattern at ~1908. */
+  function createCapturingAgent() {
+    const updates: SessionNotification[] = [];
+    const mockClient = {
+      sessionUpdate: async (n: SessionNotification) => {
+        updates.push(n);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates };
+  }
+
+  function toolCallUpdatesFor(updates: SessionNotification[], toolCallId: string) {
+    return updates.filter(
+      (u) =>
+        u.update.sessionUpdate === "tool_call_update" &&
+        (u.update as any).toolCallId === toolCallId,
+    );
+  }
+
+  it("holds a backgrounded tool's card in_progress instead of finalizing it on tool_result", async () => {
+    const { agent, updates } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        taskStarted("task-bg", "toolu_bash"),
+        toolResult("toolu_bash"),
+        successResult(),
+      ]),
+      {
+        toolUseCache: {
+          toolu_bash: {
+            type: "tool_use",
+            id: "toolu_bash",
+            name: "Bash",
+            input: { command: "sleep 100" },
+          },
+        },
+      },
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const calls = toolCallUpdatesFor(updates, "toolu_bash");
+    expect(calls.length).toBeGreaterThan(0);
+    expect((calls[calls.length - 1].update as any).status).toBe("in_progress");
+  });
+
+  it("finalizes the held card when a later task_notification settles the task", async () => {
+    const { agent, updates } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        taskStarted("task-bg", "toolu_bash"),
+        toolResult("toolu_bash"),
+        successResult(),
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "task-bg",
+          tool_use_id: "toolu_bash",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+      ]),
+      {
+        toolUseCache: {
+          toolu_bash: {
+            type: "tool_use",
+            id: "toolu_bash",
+            name: "Bash",
+            input: { command: "sleep 100" },
+          },
+        },
+      },
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    // The task_notification (and its finalize) land after the turn's own
+    // result already resolved prompt() — drain the persistent consumer so
+    // that late processing completes before asserting.
+    await agent.sessions["test-session"]?.consumer;
+
+    const calls = toolCallUpdatesFor(updates, "toolu_bash");
+    expect((calls[calls.length - 1].update as any).status).toBe("completed");
+    expect(agent.sessions["test-session"]!.runningTasks.size).toBe(0);
+  });
+
+  it("surfaces a running subagent in the plan via background_tasks_changed, then drops it once it settles", async () => {
+    const { agent, updates } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        taskStarted("agent-9", "toolu_task", {
+          subagent_type: "code-reviewer",
+          task_type: "subagent",
+        }),
+        {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [{ task_id: "agent-9", task_type: "subagent", description: "Investigate" }],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-9",
+          tool_use_id: "toolu_task",
+          status: "completed",
+          output_file: "",
+          summary: "",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    await agent.sessions["test-session"]?.consumer;
+
+    const planUpdates = updates.filter((u) => u.update.sessionUpdate === "plan");
+    expect(planUpdates.length).toBeGreaterThan(0);
+    expect(
+      planUpdates.some((u) =>
+        (u.update as any).entries.some(
+          (e: any) => e.content === "subagent: code-reviewer" && e.status === "in_progress",
+        ),
+      ),
+    ).toBe(true);
+
+    const lastPlan = planUpdates[planUpdates.length - 1];
+    expect((lastPlan.update as any).entries).not.toContainEqual(
+      expect.objectContaining({ content: "subagent: code-reviewer" }),
+    );
+  });
+
+  it("does not regress a foreground tool_result: card completes and no plan entry appears", async () => {
+    const { agent, updates } = createCapturingAgent();
+    injectGeneratorSession(agent, makeGenerator([toolResult("toolu_read"), successResult()]), {
+      toolUseCache: {
+        toolu_read: {
+          type: "tool_use",
+          id: "toolu_read",
+          name: "Read",
+          input: { file_path: "/x" },
+        },
+      },
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const calls = toolCallUpdatesFor(updates, "toolu_read");
+    expect(calls.length).toBeGreaterThan(0);
+    expect((calls[calls.length - 1].update as any).status).toBe("completed");
+
+    // No task_started fired and no todos exist, so no plan should carry an
+    // in_progress (running-task) row.
+    const planUpdates = updates.filter((u) => u.update.sessionUpdate === "plan");
+    for (const p of planUpdates) {
+      expect((p.update as any).entries.some((e: any) => e.status === "in_progress")).toBe(false);
+    }
+  });
+
+  it("buildMergedPlanEntries unions real todos with backgrounded, non-ambient running tasks (pure)", () => {
+    // Non-ambient + backgrounded ("a") must appear; not-yet-backgrounded ("b")
+    // and ambient/skip_transcript ("c") must not, regardless of backgrounded.
+    const taskState: TaskState = new Map([["t1", { subject: "Write docs", status: "pending" }]]);
+    const runningTasks = new Map<string, RunningTask>([
+      [
+        "a",
+        {
+          taskId: "a",
+          type: "subagent",
+          subagentType: "rev",
+          description: "x",
+          skipTranscript: false,
+          backgrounded: true,
+        },
+      ],
+      [
+        "b",
+        {
+          taskId: "b",
+          type: "subagent",
+          subagentType: "other",
+          description: "y",
+          skipTranscript: false,
+          backgrounded: false,
+        },
+      ],
+      [
+        "c",
+        {
+          taskId: "c",
+          type: "subagent",
+          subagentType: "ambient",
+          description: "z",
+          skipTranscript: true,
+          backgrounded: true,
+        },
+      ],
+    ]);
+
+    expect(buildMergedPlanEntries(taskState, runningTasks)).toEqual([
+      { content: "Write docs", status: "pending", priority: "medium" },
+      { content: "subagent: rev", status: "in_progress", priority: "medium" },
+    ]);
+    // The running-task half of the union, directly.
+    expect(runningTaskPlanEntries(runningTasks)).toEqual([
+      { content: "subagent: rev", status: "in_progress", priority: "medium" },
+    ]);
+  });
+
+  it("suppressBackgroundToolResults rewrites only matched, still-running tool_call_updates (pure, identity when the index is empty)", () => {
+    const notifications = [
+      {
+        sessionId: "s",
+        update: { sessionUpdate: "tool_call_update", toolCallId: "a", status: "completed" },
+      },
+      {
+        sessionId: "s",
+        update: { sessionUpdate: "tool_call_update", toolCallId: "b", status: "completed" },
+      },
+      {
+        sessionId: "s",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } },
+      },
+    ] as unknown as SessionNotification[];
+    const index = new Map([["a", "task-a"]]);
+
+    const result = suppressBackgroundToolResults(notifications, index);
+
+    expect((result[0].update as any).toolCallId).toBe("a");
+    expect((result[0].update as any).status).toBe("in_progress");
+    expect(result[1]).toEqual(notifications[1]);
+    expect(result[2]).toEqual(notifications[2]);
+
+    // Identity (same array reference) when nothing can possibly match.
+    expect(suppressBackgroundToolResults(notifications, new Map())).toBe(notifications);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Turn-settle correctness (fork feature: Feature C).
+//
+// The adapter normally settles the ACP turn at the SDK's terminal `result`
+// (issue #773's fast-unlock optimization), not at the later `idle` — but a
+// `result` carrying `deferred_tool_use` proves the turn ISN'T actually over
+// (the SDK will keep streaming past it to resume the deferred tool). Such a
+// result must not settle the turn; it parks `Turn.settleAtIdle` so the
+// turn's true turn-over `idle` settles it SUCCESS instead of falling through
+// to the issue #825 "abandoned without a result" failure. See CLAUDE.md →
+// "Background-Task Visibility" and
+// .context/plans/i-just-wanted-to-greedy-wirth.md → "Feature C".
+// ---------------------------------------------------------------------------
+describe("deferred-tool-use turn settlement (Feature C)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function createResultMessage(overrides: {
+    subtype: "success" | "error_during_execution";
+    stop_reason: string | null;
+    is_error?: boolean;
+  }) {
+    return {
+      type: "result" as const,
+      subtype: overrides.subtype,
+      stop_reason: overrides.stop_reason,
+      is_error: overrides.is_error ?? false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** A `result` that proves the turn isn't over: the SDK reports a deferred
+   *  tool call it will resume after (`SDKDeferredToolUse` — `{id, name,
+   *  input}`, per the Agent SDK's `sdk.d.ts`). */
+  function deferredResult() {
+    return {
+      ...createResultMessage({ subtype: "success", stop_reason: null }),
+      deferred_tool_use: { id: "d1", name: "Bash", input: {} },
+    };
+  }
+
+  it("seq1: a single non-deferred result still settles at the result, before idle is yielded (#773 fast path unchanged)", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+    let releaseIdle!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+    let idleYielded = false;
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield userEcho(userMessage);
+      yield createResultMessage({ subtype: "success", stop_reason: null });
+      await idleGate;
+      idleYielded = true;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(idleYielded).toBe(false);
+
+    releaseIdle();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("seq2: a deferred result does not settle the turn; the following normal result does", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+    let releaseFinal!: () => void;
+    const finalGate = new Promise<void>((resolve) => (releaseFinal = resolve));
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield userEcho(userMessage);
+      yield deferredResult();
+      await finalGate;
+      yield createResultMessage({ subtype: "success", stop_reason: null });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    let settled = false;
+    promptPromise.then(() => {
+      settled = true;
+    });
+
+    // Give the consumer a chance to process the deferred result; it must not
+    // have settled the turn from it alone.
+    await new Promise((r) => setTimeout(r, 5));
+    expect(settled).toBe(false);
+
+    releaseFinal();
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("end_turn");
+    expect(settled).toBe(true);
+  });
+
+  it("seq3: a deferred result followed directly by idle (no further result) still resolves end_turn, not #825", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield userEcho(userMessage);
+      yield deferredResult();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
+  it("seq4: cancelling while a deferred result has parked the turn resolves cancelled", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+    let releaseIdle!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield userEcho(userMessage);
+      yield deferredResult();
+      await idleGate;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    // Let the deferred result land (the turn is parked, unsettled) before
+    // cancelling it.
+    await new Promise((r) => setTimeout(r, 5));
+    await agent.cancel({ sessionId: "test-session" });
+    releaseIdle();
+
+    await expect(promptPromise).resolves.toMatchObject({ stopReason: "cancelled" });
+  });
+
+  it("requires_action pause: a mid-turn requires_action event does not settle or fail the turn", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield userEcho(userMessage);
+      yield { type: "system", subtype: "session_state_changed", state: "requires_action" };
+      yield createResultMessage({ subtype: "success", stop_reason: null });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    // Resolves exactly once with end_turn (a native Promise can't resolve
+    // twice; if requires_action wrongly failed/settled the turn early, this
+    // would either reject or resolve with the wrong stop reason instead).
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+  });
+
+  describe("owed-idle accounting doesn't leak across turns", () => {
+    it("(a) baseline: idle with no result and no deferred still fails the turn (issue #825)", async () => {
+      const agent = createMockAgent();
+      const input = new Pushable<any>();
+
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+
+      agent.sessions["test-session"] = mockSessionState({
+        query: wrapQuery(messageGenerator()),
+        input,
+      });
+
+      await expect(
+        agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+      ).rejects.toThrow(/without a result/);
+    });
+
+    it("(b) a deferred-then-final turn's owed accounting doesn't leak into the next turn", async () => {
+      const agent = createMockAgent();
+      const input = new Pushable<any>();
+
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        // Turn 1: deferred result -> final result -> idle.
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield deferredResult();
+        yield createResultMessage({ subtype: "success", stop_reason: null });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+
+        // Turn 2: single result -> idle. If turn 1 over- or under-counted its
+        // owed trailing idle, this turn's own idle would be mis-absorbed (or
+        // it would false-fail with the #825 "abandoned" error).
+        const u2 = await iter.next();
+        yield userEcho(u2.value);
+        yield createResultMessage({ subtype: "success", stop_reason: null });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+
+      agent.sessions["test-session"] = mockSessionState({
+        query: wrapQuery(messageGenerator()),
+        input,
+      });
+
+      const first = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "first" }],
+      });
+      expect(first.stopReason).toBe("end_turn");
+
+      const second = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "second" }],
+      });
+      expect(second.stopReason).toBe("end_turn");
     });
   });
 });

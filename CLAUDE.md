@@ -7,6 +7,7 @@ This is a fork of [`zed-industries/claude-agent-acp`](https://github.com/zed-ind
 In v0.18.0 (PR #316), the upstream repo removed an in-process MCP server that previously routed Claude Code's file Write/Edit operations through Zed's ACP filesystem APIs (`fs/write_text_file`). This removal eliminated the "Review Changes" multibuffer UI where users could accept/reject edits inline within Zed.
 
 The MCP server was removed because it had critical bugs:
+
 - Subagents (Task tool) couldn't access MCP tools, causing Write/Edit to silently fail
 - `mcp__acp__Read` returned stale buffer content
 - Image/binary file handling was broken
@@ -45,6 +46,7 @@ Additions appended at end of file:
 7. **`createPreToolUseHook()` factory** — A PreToolUse hook factory parallel to `createPostToolUseHook`. Accepts an optional `onPreWrite(filePath)` callback that fires for `tool_name === "Write"`, feeding the interceptor's pre-existence/content cache.
 
 Key design decisions:
+
 - **PostToolUse intercept, not MCP** — Built-in Edit/Write execute normally, then the PostToolUse hook intercepts, reverts, and routes through ACP. This works for both main sessions and subagents (subagents use built-in tools directly, which the PostToolUse hook can intercept).
 - **PreToolUse for Write only** — Edit relies on a prior Read (the built-in Edit tool requires it), so the read-cache is sufficient. Write doesn't require Read, so we capture pre-existence/content via PreToolUse. This lets us correctly revert Write of a brand-new file (delete) vs. overwrite of an existing file (restore).
 - **No system prompt needed** — Claude uses its built-in Edit/Write tools naturally. No tool redirection or MCP tool names to worry about.
@@ -67,11 +69,13 @@ Changes in `toAcpNotifications()` and `streamEventToAcpNotifications()`:
 4. **`fileEditInterceptor` option**: Both functions accept an optional `fileEditInterceptor` in their options. In the `onPostToolUseHook` callback, if the tool is Edit or Write, the interceptor's `interceptEditWrite` is called with `client.writeTextFile` before the normal notification logic runs.
 
 New imports at top of file:
+
 ```typescript
 import { createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
 ```
 
 Session type addition:
+
 ```typescript
 fileEditInterceptor?: FileEditInterceptor;
 ```
@@ -79,6 +83,7 @@ fileEditInterceptor?: FileEditInterceptor;
 ### Modified: `src/lib.ts`
 
 Added exports:
+
 ```typescript
 export { ..., createFileEditInterceptor, type FileEditInterceptor } from "./tools.js";
 ```
@@ -144,18 +149,20 @@ In addition to the FileEditInterceptor, this fork adds model-aware session confi
 
 1. **`effort_level` selector** — When the current model supports effort levels (`ModelInfo.supportsEffort`), a "thought_level" category select appears in the session config. Uses `query.applyFlagSettings({ effortLevel })` to apply changes.
 
-2. **`fast_mode` toggle** — *(fork version removed)* The fork originally added its own Fast mode select (a `fastModeState` "off"/"cooldown"/"on" field + a `"fast_mode"` config option). Upstream later shipped a first-class Fast mode config (#828, config id `"fast"`, boolean `fastModeEnabled`, `createFastModeConfigOption`, `syncFastModeState`, `fastModeStateEnabled`, boolean-option support via `clientSupportsBooleanConfigOptions`). Per the "prefer upstream's reimplementation" rule, the fork's version was dropped entirely in the v0.54.1 merge — Fast mode is now **upstream's** feature and needs no fork maintenance.
+2. **`fast_mode` toggle** — _(fork version removed)_ The fork originally added its own Fast mode select (a `fastModeState` "off"/"cooldown"/"on" field + a `"fast_mode"` config option). Upstream later shipped a first-class Fast mode config (#828, config id `"fast"`, boolean `fastModeEnabled`, `createFastModeConfigOption`, `syncFastModeState`, `fastModeStateEnabled`, boolean-option support via `clientSupportsBooleanConfigOptions`). Per the "prefer upstream's reimplementation" rule, the fork's version was dropped entirely in the v0.54.1 merge — Fast mode is now **upstream's** feature and needs no fork maintenance.
 
 2b. **`ultracode` (effort-list entry)** — Ultracode is the SDK's session-scoped flag meaning "xhigh effort + standing dynamic-workflow orchestration" (see `Settings.ultracode`). Rather than a separate toggle, it appears as an extra **`"ultracode"` entry at the bottom of the existing Effort (`thought_level`) dropdown**, mirroring the native Claude Code thinking-level menu. The entry is added only when the current model is xhigh-capable (`ModelInfo.supportedEffortLevels` includes `"xhigh"`) **and** the Workflows feature is enabled. Selection is handled in the `effort` branch of `applyConfigOptionValue()`: choosing `"ultracode"` calls `query.applyFlagSettings({ ultracode: true })`; choosing any real effort level (or `"default"`) calls `applyFlagSettings({ effortLevel, ultracode: false })` to turn it back off and apply the chosen level in one call. It is **not** a real effort level (the SDK effort enum stays `low/medium/high/xhigh/max`) and is **never persisted** (session-scoped). Gating details:
-   - **Workflows-enabled** is inferred at `createSession()` as "enabled unless explicitly disabled" — `settings.disableWorkflows !== true && settings.enableWorkflows !== false && !process.env.CLAUDE_CODE_DISABLE_WORKFLOWS` — because the SDK exposes no control call that reports the plan-default state. Stored on the session as `workflowsEnabled`.
-   - **Initial state** seeds from `settings.ultracode` (the SDK already applied that itself, so no `applyFlagSettings` at init — we only mirror it into the effort dropdown's `currentValue`, and the init effort-apply skips the `"ultracode"` value), tracked on the session as `ultracode`.
-   - On model switch to a **non-xhigh** model the entry disappears and `session.ultracode` is reset to `false` locally; the effort-sync clears the SDK flag (`ultracode: false`) when the switch turned it off.
+
+- **Workflows-enabled** is inferred at `createSession()` as "enabled unless explicitly disabled" — `settings.disableWorkflows !== true && settings.enableWorkflows !== false && !process.env.CLAUDE_CODE_DISABLE_WORKFLOWS` — because the SDK exposes no control call that reports the plan-default state. Stored on the session as `workflowsEnabled`.
+- **Initial state** seeds from `settings.ultracode` (the SDK already applied that itself, so no `applyFlagSettings` at init — we only mirror it into the effort dropdown's `currentValue`, and the init effort-apply skips the `"ultracode"` value), tracked on the session as `ultracode`.
+- On model switch to a **non-xhigh** model the entry disappears and `session.ultracode` is reset to `false` locally; the effort-sync clears the SDK flag (`ultracode: false`) when the switch turned it off.
 
 3. **Model capability tracking** — `Session` stores `modelInfos: ModelInfo[]` (the raw SDK model list). When the user switches models via `setSessionConfigOption("model", ...)`, `buildConfigOptions()` is called to rebuild the config options, showing or hiding effort/fast/ultracode options based on the new model's capabilities.
 
 > **Note:** A fork-specific `context_display` ("Context") dropdown previously lived here. It was **removed** once Zed added a native context-window display — keeping ours would double up. The removal dropped `src/context-display.ts`, the `contextDisplayView`/`contextDisplayState` Session fields, the `buildConfigOptions()` `contextDisplay` param, the `pushContextDisplayOption()` method, the `getContextUsage()`-at-init fetch (reverted to upstream's `inferContextWindowFromModel` seed for `contextWindowSize`), and the `result`/`compact_boundary`/model-switch hooks. `contextWindowSize`/`inferContextWindowFromModel`/`getContextUsage` are upstream-shared and stay.
 
 **Modified areas in `src/acp-agent.ts`:**
+
 - `Session` type: added `ultracode`, `workflowsEnabled`, `effortLevel`, `modelInfos` fields (Fast mode's `fastModeEnabled` is upstream's, not ours)
 - `buildConfigOptions()`: accepts optional `modelInfos`, `currentEffortLevel`, and `ultracode` (`{ workflowsEnabled, state }`) params; conditionally pushes the `effort_level` option. The `ultracode` param adds an `"ultracode"` entry to the effort option (and makes it the effort `currentValue` when on) — it is not a separate option. **The `ultracode` param is kept LAST in the signature (after upstream's `agents`/`currentAgent`/`fastMode`)** so upstream's positional call sites/tests don't shift on re-merge
 - `applyConfigOptionValue()`: handles the `effort_level` config ID (the if/else chain that `setSessionConfigOption()` and `updateConfigOption()` both call); the `effort` branch special-cases the `"ultracode"` value (toggling the SDK `ultracode` flag); model handler rebuilds config options and resets `ultracode` for non-xhigh models (clearing the SDK flag via the effort-sync)
@@ -167,15 +174,63 @@ Upstream surfaces whatever the SDK's model list returns. We verified empirically
 
 **Changes in `src/acp-agent.ts`:**
 
-1. **`FORK_MODEL_PICKER`** — A constant `ReadonlyArray` of the 8 picker entries in native-picker order, each with `value` / `displayName` / `description` / `family`. The `value`s are real model IDs/aliases verified to exist in the bundled binary's registry: `fable` (Fable 5), `opus[1m]` (Opus 4.8 1M), `opus` (Opus 4.8), `claude-opus-4-7[1m]` (Opus 4.7 1M), `claude-opus-4-7` (Opus 4.7), `claude-opus-4-6[1m]` (Opus 4.6 1M), `sonnet` (Sonnet 4.6), `haiku` (Haiku 4.5). The first entry (`fable`) is the default selection; it carries `family: "opus"` so it donates the SDK `default` (flagship) capability template. (Fable was dropped when Anthropic briefly removed the model and re-added here once it returned to the bundled binary's registry.)
+1. **`FORK_MODEL_PICKER`** — A constant `ReadonlyArray` of the 7 picker entries in native-picker order, each with `value` / `displayName` / `description` / `family`. The `value`s are real model IDs/aliases verified to exist in the bundled binary's registry: `fable` (Fable 5), `opus[1m]` (Opus 4.8 1M), `claude-opus-4-7[1m]` (Opus 4.7 1M), `claude-opus-4-6[1m]` (Opus 4.6 1M), `sonnet` (Sonnet 5), `claude-sonnet-4-6` (Sonnet 4.6), `haiku` (Haiku 4.5). The first entry (`fable`) is the default selection; it carries `family: "opus"` so it donates the SDK `default` (flagship) capability template. (Fable was dropped when Anthropic briefly removed the model and re-added here once it returned to the bundled binary's registry.) **1M-only policy:** where a model has both a 1M and a non-1M variant, only the 1M entry is listed (the non-1M `opus`/`claude-opus-4-7` entries were removed) since 1M is a strict superset; a model with no 1M variant (e.g. `sonnet`, `claude-sonnet-4-6`, `haiku`) is listed as-is.
 
 2. **`FORK_MODEL_CAPABILITY_FALLBACK`** — Per-family (`opus`/`sonnet`/`haiku`) capability flags used when the SDK doesn't surface a family template to copy from (e.g. a stripped-down test mock). Mirrors the live SDK's per-family shape.
 
 3. **`buildForkModelList(sdkModels)`** (exported) — Builds `FORK_MODEL_PICKER` into a `ModelInfo[]`, carrying each entry's display info verbatim and donating capability flags (effort levels, fast/auto mode, adaptive thinking) from the matching SDK **family template** (`default` → Opus, `sonnet`/`haiku` for the others), falling back to `FORK_MODEL_CAPABILITY_FALLBACK`. This keeps effort/fast/auto gating in `buildConfigOptions()` accurate. (Older Opus variants inherit the latest-Opus family flags — a small approximation the CLI re-validates at turn time.)
 
-4. **`createSession()` wiring** — When the user has **not** set an `availableModels` allowlist, `allowedModels` is `buildForkModelList(initializationResult.models)` (the fork picker). When they **have**, the original `applyAvailableModelsAllowlist(initializationResult.models, …)` behavior is kept verbatim (the user opted into a specific list). `initializationResult.models` (the SDK's real list) is still passed to `getAvailableModels()` as the skip-`setModel` reference, so pinning a fork-only ID like `claude-opus-4-7` correctly issues a `setModel` call while a value the SDK already surfaced is skipped.
+4. **`createSession()` wiring** — When the user has **not** set an `availableModels` allowlist, `allowedModels` is `buildForkModelList(initializationResult.models)` (the fork picker). When they **have**, the original `applyAvailableModelsAllowlist(initializationResult.models, …)` behavior is kept verbatim (the user opted into a specific list). `initializationResult.models` (the SDK's real list) is still passed to `getAvailableModels()` as the skip-`setModel` reference, so pinning a fork-only ID like `claude-opus-4-7[1m]` correctly issues a `setModel` call while a value the SDK already surfaced is skipped.
 
 **Maintenance:** because the picker is now an explicit list, a new Fable/Opus/Sonnet/Haiku generation won't appear automatically — update `FORK_MODEL_PICKER` (and bump the bundled SDK so the new IDs resolve). The default selection is the first entry (currently `fable`); if Anthropic moves the recommended default, update the list's first entry. Covered by `src/tests/fork-model-list.test.ts`; the resolution/allowlist/auto-mode cases live in `src/tests/acp-agent-settings.test.ts`.
+
+### Background-Task Visibility
+
+The SDK ends the ACP turn (`result` → `end_turn`) when a foreground model invocation finishes, but background work (subagents, Bash, monitors, workflows) and auto-continuations keep running. Rather than hold the turn open (which upstream rejects and ACP v2 removes), this fork surfaces ongoing work and settles the turn at the authoritative `idle` signal instead, fixing a UX gap where the composer unlocks while Claude is still working.
+
+**Three additive features:**
+
+1. **Backgrounded tool cards stay `in_progress`** — When a tool_result carries `deferred_tool_use` or the SDK marks a task backgrounded, the corresponding ACP tool-call card stays spinning instead of immediately finishing. The card finalizes late when the background task terminates (via a terminal `task_notification`/`task_updated` event). This keeps the user aware the work continues. Foreground subagents get a brief `in_progress` flicker then finalize on their terminal edge — an accepted side effect.
+
+2. **Running tasks appear in the plan panel** — Background tasks are mirrored into the ACP plan as `in_progress` entries with human-readable labels: `subagent: <type>`, `shell: <command>`, or the task's description for other/unknown `task_type`s (no emoji — the `in_progress` status already renders a spinner in the client; see `runningTaskLabel`). The plan is the sole surface — rows persist across turns while work continues, and disappear when the task settles. This is achieved via a single-owner combiner (`buildMergedPlanEntries`) that unions todo-plan entries with running-task plan entries.
+
+3. **Turn settles at `idle`, not a non-terminal `result`** — When a `result` carries `deferred_tool_use` (the only cleanly-detectable non-terminal case), the fork does **not** settle the turn; instead, the turn remains pending until the final result or the authoritative `idle` signal. This fixes the unlock-too-early symptom for deferred-tool turns. Normal single-result turns still unlock immediately (no #773 regression). Pure auto-continuations (undetectable at result-time) are out of scope.
+
+**Files modified:**
+
+- `src/tools.ts` — `RunningTask` type; `runningTaskLabel()`, `runningTaskPlanEntries()`, `buildMergedPlanEntries()`, `suppressBackgroundToolResults()` helpers; `runningTasks?` added to `toAcpNotifications`/`streamEventToAcpNotifications` options.
+- `src/acp-agent.ts` — Session fields `runningTasks` (Map) and `runningTaskByToolUseId` (reverse index); consumer handlers `task_started`, `task_notification`, `task_updated`, `background_tasks_changed`; private methods `emitPlan()` and `finalizeRunningTask()`; suppression wiring at the consolidated tool-result emit; plan-combiner integration at `createTaskHook` onChange and TodoWrite/Task* plan-emit sites; `Turn.settleAtIdle` flag for deferred-result logic; `result` handler checks `deferred_tool_use` to defer settlement; `idle` handler branch for settlement-at-idle (precedence: cancel > owed-decrement > deferred-settle > #825 no_result); requires_action/running no-op branch documents paused-turn correctness.
+
+**Merge-maintenance notes:**
+
+- **Single plan-emit owner** — The combiner `buildMergedPlanEntries` is the only producer of ACP plan entries. Every `sessionUpdate: "plan"` must route through it (two sites in acp-agent.ts + one in toAcpNotifications). If you add a new plan-emit, wire it through the combiner.
+- **`settleAtIdle` turn-lifecycle hook** — A fork-only per-turn flag that defers settlement from a non-terminal `result` to the `idle` handler. If upstream reworks the result/idle handlers, re-anchor this hook to the new structure.
+- **`background_tasks_changed` handler** — Previously a no-op `break`. Now splits its own branch (REPLACE-reconcile the `backgrounded` flag against the SDK payload, synthesize missing entries, emit plan). If upstream changes the consumer switch structure, keep this logic.
+- **owed-accounting adjustment** — When a result carries `deferred_tool_use`, it does not increment the owed counter (no trailing idle of its own). The deferred-settle branch in the idle handler keeps the accounting correct across sequences (normal → deferred→final → idle → deferred→idle).
+
+#### If Zed Changes Behavior
+
+These features depend on specific Zed rendering behavior (verified as of this work in Zed `crates/acp_thread/src/acp_thread.rs`). Document what to do if Zed changes:
+
+**Dependency 1: Zed applies session updates regardless of turn state**
+
+- Current: Zed processes `tool_call`, `tool_call_update`, `plan` updates even after `end_turn` (no running-turn guard). This is how late `finalizeRunningTask()` and post-turn plan updates render.
+- If Zed starts dropping updates outside an active turn: Feature A's late card finalization and Feature B's post-turn plan updates stop rendering. Mitigation: keep the turn open via deferred settlement (Feature C-style) or migrate to an ACP v2 mechanism when it ships. Affected code: the `finalizeRunningTask()` late-emit in `background_tasks_changed` and the final `emitPlan()` call in both terminal task edges.
+
+**Dependency 2: Zed keeps in_progress cards spinning indefinitely**
+
+- Current: Zed does not auto-cancel or auto-finalize `in_progress` tool cards on a clean `end_turn`. Cards spin forever until a `tool_call_update` with a terminal status (`completed`, `failed`, etc.) arrives.
+- If Zed adds an inactivity timeout (e.g., auto-cancel after 5 min idle): add the deferred heartbeat — emit `tool_call_update{status:"in_progress"}` from the `task_progress` handler (acp-agent.ts:2461, already fires for a different tool id) on a cadence (e.g., every 30 sec). If Zed starts marking in_progress cards Canceled/Failed on `end_turn`: Feature A breaks; card finalization would need a different surface (e.g., UI toast, new ACP message type, or a "deferred" card status).
+
+**Dependency 3: Zed keeps in_progress plan entries across turns**
+
+- Current: Zed only snapshots/clears a plan when nothing is pending/in_progress (having a running-task `in_progress` entry counts as pending). This is why running-task rows persist across turns until the task settles.
+- If Zed changes plan-clear semantics: running-task rows may vanish mid-turn or a finished todo plan may freeze with a stale running-task row. Mitigation: switch to a dedicated surface (UI pane, toast, or terminal output) instead of piggybacking on the plan panel.
+
+**Dependency 4 (edge case): User Stop during a later turn**
+
+- Current: User hits Stop during turn N+1. Zed marks all outstanding `in_progress` cards Canceled. But the SDK task lives on (stop only cancels the main turn). When the background task terminates, the fork emits `tool_call_update{status:"completed"}` to overwrite the Canceled status.
+- If Zed stops honoring late `tool_call_update` overwrites: the card remains Canceled even though the task succeeded. Workaround: require user to manually accept Canceled cards-that-succeeded, or document the gap.
 
 ## How to Merge Upstream Updates
 
@@ -194,8 +249,9 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - `/btw <question>` side-question: a fork-only feature (upstream has no `/btw`). It is dispatched from `prompt()` (before the turn is enqueued) to `handleBtwQuestion()`, which spawns an ephemeral non-persisted `query()` and serializes behind the main turn via `session.idleResolvers`. **Ported onto upstream's `turnQueue`/consumer model:** the "main busy" check uses `session.activeTurn`/`turnQueue` (not the removed `promptRunning`), and `idleResolvers` are drained by `maybeReleaseIdleWaiters()` from the consumer's `settleActive`/`failActive` paths (not an old `prompt()` finally block). `cancel()` also drains `idleResolvers` and interrupts `session.btwQuery`. Session fields: `btwQuery?`, `idleResolvers`, `hasRunMainPrompt`. If upstream reworks the consumer/turn model again, re-anchor these hooks rather than reintroducing `promptRunning`.
    - `CLAUDE_CODE_THINKING_DISPLAY` env-var opt-in (~8 lines in `createSession()` near `maxThinkingTokens`): reads `process.env.CLAUDE_CODE_THINKING_DISPLAY` (`"summarized"` or `"omitted"`), spreads `thinking: { type: "adaptive", display }` into `Options` only when set. Opus 4.7 defaults `display` to `"omitted"`; this restores populated thinking streams when users opt in via Zed's `agent_servers.env`.
    - Expanded model picker: `FORK_MODEL_PICKER` / `FORK_MODEL_CAPABILITY_FALLBACK` constants + `buildForkModelList()` (defined just before `applyAvailableModelsAllowlist`), and the `createSession()` `allowedModels` branch that uses `buildForkModelList(initializationResult.models)` when no `availableModels` allowlist is set. If upstream changes the `allowedModels`/`getAvailableModels` block, keep our no-allowlist branch pointed at `buildForkModelList`.
+   - Background-task visibility: `Session` fields `runningTasks`/`runningTaskByToolUseId` init (~2 lines in `createSession()`); consumer handlers `task_started`/`task_notification`/`task_updated`/`background_tasks_changed` with upserts and terminal edges; `emitPlan()` and `finalizeRunningTask()` helper methods; plan-combiner wiring at `createTaskHook` onChange (both blocks use `buildMergedPlanEntries`); suppresssion at the consolidated tool-result emit (~5 lines, `suppressBackgroundToolResults` wraps `toAcpNotifications`); `Turn.settleAtIdle` flag; result handler checks `deferred_tool_use` (few lines after `isTaskNotification`); owed-increment guard excludes deferred results; deferred-settlement path in the idle handler (branch C, after owed-decrement, before #825 fail); requires_action/running no-op branch. Covered by new tests in `src/tests/acp-agent.test.ts`.
 
-   If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, `setSessionConfigOption()`, or `applyConfigOptionValue()`, our blocks need to stay in the same logical positions.
+   If upstream modifies `createSession()`, `toAcpNotifications()`, `streamEventToAcpNotifications()`, `buildConfigOptions()`, `setSessionConfigOption()`, `applyConfigOptionValue()`, or the consumer `runConsumer` switch structure, our blocks need to stay in the same logical positions.
 
 2. **`src/tools.ts`** — Our changes are:
    - `fs` import addition at the top
@@ -203,8 +259,9 @@ When pulling changes from `zed-industries/claude-agent-acp`:
    - `.context/` bypass check inside `isInScope` (used by both `onPreWrite` and `interceptEditWrite`)
    - `onFileRead` option added to `createPostToolUseHook`
    - `onPreWrite` option on `createPreToolUseHook`; `nonExistentFiles` set in the interceptor's closure
+   - Background-task helpers appended at end of file: `RunningTask` type, `runningTaskLabel()`, `runningTaskPlanEntries()`, `buildMergedPlanEntries()`, `suppressBackgroundToolResults()`; `runningTasks?` parameter added to `toAcpNotifications` and `streamEventToAcpNotifications` options types and threaded through.
 
-   If upstream adds new tool handling, our additions are all at the end of the file and shouldn't conflict.
+   If upstream adds new tool handling or modifies plan emission, our additions are all at the end of the file and shouldn't conflict. When wiring new plan emits, route through `buildMergedPlanEntries` (the single combiner).
 
 3. **`src/lib.ts`** — Export lines. Straightforward to re-add if upstream modifies exports.
 
@@ -223,6 +280,7 @@ Zed <──ACP (ndjson/stdio)──> ClaudeAcpAgent <──Claude Agent SDK─�
 ```
 
 ### Flow: Edit/Write (Main Session and Subagents)
+
 1. Claude calls the built-in Edit or Write tool
 2. The tool executes normally, writing to disk
 3. PostToolUse hook fires → `interceptEditWrite` is called
@@ -234,6 +292,7 @@ Zed <──ACP (ndjson/stdio)──> ClaudeAcpAgent <──Claude Agent SDK─�
 9. Cache is updated with the new content for consecutive edits
 
 ### Flow: Uncached File Edit
+
 1. Claude edits a file it never explicitly Read (e.g., found via Grep)
 2. No cached content → interceptor reads the new content from disk (already written by built-in tool)
 3. No original content to revert to → revert is skipped

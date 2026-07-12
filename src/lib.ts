@@ -18,6 +18,11 @@ export {
   toolUpdateFromToolResult,
   createFileEditInterceptor,
   type FileEditInterceptor,
+  runningTaskLabel,
+  runningTaskPlanEntries,
+  buildMergedPlanEntries,
+  suppressBackgroundToolResults,
+  type RunningTask,
 } from "./tools.js";
 export { SettingsManager, type SettingsManagerOptions } from "./settings.js";
 

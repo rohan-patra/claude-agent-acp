@@ -102,6 +102,7 @@ import { SettingsManager } from "./settings.js";
 import {
   applyTaskCreate,
   applyTaskUpdate,
+  buildMergedPlanEntries,
   ClaudePlanEntry,
   createFileEditInterceptor,
   createPostToolUseHook,
@@ -111,8 +112,10 @@ import {
   parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
+  type RunningTask,
+  runningTaskPlanEntries,
+  suppressBackgroundToolResults,
   TaskState,
-  taskStateToPlanEntries,
   toolInfoFromToolUse,
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
@@ -213,6 +216,13 @@ type Turn = {
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
+  /** Set by the `result` handler when a `deferred_tool_use` result proves the
+   *  turn isn't actually over (the SDK will keep streaming past this result).
+   *  Parks the SUCCESS settle for this turn's true turn-over idle instead of
+   *  settling now (would unlock the composer early) or letting the #825
+   *  no-result guard fail it at that later idle. Turn is created fresh per
+   *  prompt, so no reset is needed. */
+  settleAtIdle?: boolean;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
 };
@@ -348,6 +358,19 @@ type Session = {
    *  tasks (background Bash etc.) also pass through the map; see the
    *  `task_started` handler. */
   subagentParentToolUseIds: Map<string, string>;
+  /** Live background tasks (subagents, background Bash, monitors, workflows)
+   *  keyed by `task_id`, assembled from `task_started` and refined by
+   *  `background_tasks_changed` / `task_updated.patch.is_backgrounded`. Drives
+   *  holding the spawning tool card `in_progress` past a premature `result`
+   *  (see `suppressBackgroundToolResults`) and merging running-task rows into
+   *  the ACP plan (see `buildMergedPlanEntries`). Removed on the task's
+   *  terminal `task_notification`/`task_updated` via `finalizeRunningTask`. */
+  runningTasks: Map<string, RunningTask>;
+  /** Reverse index: spawning tool_use id → task_id, kept in sync with
+   *  `runningTasks` on every insert/remove. Lets the consolidated tool_result
+   *  emit look up whether a given tool_call_update belongs to a still-running
+   *  background task without scanning `runningTasks`. */
+  runningTaskByToolUseId: Map<string, string>;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -519,8 +542,7 @@ function isMuslLibc(): boolean {
   // process.report.getReport().header.glibcVersionRuntime is populated when
   // Node is dynamically linked against glibc, and absent on musl.
   const report = process.report?.getReport() as
-    | { header?: { glibcVersionRuntime?: string } }
-    | undefined;
+    { header?: { glibcVersionRuntime?: string } } | undefined;
   return !report?.header?.glibcVersionRuntime;
 }
 
@@ -1067,6 +1089,50 @@ export class ClaudeAcpAgent {
     });
   }
 
+  /** Re-emit the plan from the sole combiner (`buildMergedPlanEntries`) so a
+   *  `runningTasks` mutation (background-visibility flip, terminal removal)
+   *  is reflected without waiting for the next TodoWrite/Task* message. */
+  private async emitPlan(session: Session, sessionId: string): Promise<void> {
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "plan",
+        entries: buildMergedPlanEntries(session.taskState, session.runningTasks),
+      },
+    });
+  }
+
+  /** Emit the late finalizing `tool_call_update` for a settled background task
+   *  and drop it from `runningTasks` (+ the reverse index) and the plan. A
+   *  no-op if the task was already removed — both the `task_notification` and
+   *  the terminal `task_updated` patch can fire for the same transition. */
+  private async finalizeRunningTask(
+    session: Session,
+    sessionId: string,
+    taskId: string,
+    outcome: "completed" | "failed",
+    summary?: string,
+  ): Promise<void> {
+    const task = session.runningTasks.get(taskId);
+    if (!task) return;
+    session.runningTasks.delete(taskId);
+    if (task.toolUseId) {
+      session.runningTaskByToolUseId.delete(task.toolUseId);
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: task.toolUseId,
+          status: outcome,
+          ...(summary
+            ? { content: [{ type: "content" as const, content: { type: "text", text: summary } }] }
+            : {}),
+        },
+      });
+    }
+    await this.emitPlan(session, sessionId);
+  }
+
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
@@ -1597,6 +1663,20 @@ export class ClaudeAcpAgent {
                     // decrement would leak the debt permanently.
                     owedTrailingIdles--;
                   } else if (
+                    session.activeTurn &&
+                    !session.activeTurn.settled &&
+                    session.activeTurn.settleAtIdle
+                  ) {
+                    // A `deferred_tool_use` result earlier in this turn parked
+                    // its SUCCESS settle here (see the `result` handler) rather
+                    // than settling early or falling through to the #825
+                    // no-result guard below. This IS that turn's true
+                    // turn-over idle — settle it now, with whatever
+                    // `stopReason` accumulated from any further
+                    // results/streaming after the deferred one (defaults to
+                    // "end_turn" if none arrived).
+                    settleActive({ stopReason, usage: sessionUsage(session) });
+                  } else if (
                     !session.cancelled &&
                     session.activeTurn &&
                     !session.activeTurn.settled
@@ -1625,6 +1705,13 @@ export class ClaudeAcpAgent {
                   // signal, so it's the point at which a new title may have
                   // landed. Push it to the client if it changed.
                   await this.maybeUpdateSessionTitle(params.sessionId, session);
+                } else if (message.state === "requires_action" || message.state === "running") {
+                  // Documented no-op: a paused (e.g. AskUserQuestion/plan
+                  // confirmation, both parked in `canUseTool` rather than a
+                  // premature `result`) or still-running turn must not settle,
+                  // and must not touch the owed-idle debt or `settleAtIdle` —
+                  // those are only meaningful at the turn's true turn-over
+                  // idle, which this is not.
                 }
                 break;
               }
@@ -1752,7 +1839,7 @@ export class ClaudeAcpAgent {
               case "files_persisted":
               case "task_progress":
                 break;
-              case "task_started":
+              case "task_started": {
                 // For subagent tasks `task_id` is the subagent's agent id (the
                 // SDK keys its task registry by agent id) and `tool_use_id` is
                 // the Agent/Task tool_use that spawned it. Record the mapping so
@@ -1764,23 +1851,62 @@ export class ClaudeAcpAgent {
                 if (message.tool_use_id) {
                   session.subagentParentToolUseIds.set(message.task_id, message.tool_use_id);
                 }
+                // Upsert the RunningTask entry (merge, don't clobber — a prior
+                // `background_tasks_changed` may have already synthesized an
+                // ids-only entry for this task before this edge arrives).
+                const existing = session.runningTasks.get(message.task_id);
+                session.runningTasks.set(message.task_id, {
+                  taskId: message.task_id,
+                  toolUseId: message.tool_use_id ?? existing?.toolUseId,
+                  type: message.subagent_type
+                    ? "subagent"
+                    : (message.task_type ?? existing?.type ?? "task"),
+                  subagentType: message.subagent_type ?? existing?.subagentType,
+                  description: message.description ?? existing?.description ?? "",
+                  skipTranscript: message.skip_transcript ?? existing?.skipTranscript ?? false,
+                  backgrounded: existing?.backgrounded ?? false,
+                });
+                if (message.tool_use_id) {
+                  session.runningTaskByToolUseId.set(message.tool_use_id, message.task_id);
+                }
                 break;
+              }
               case "task_notification":
                 // The task settled — no further tool calls can originate from
                 // it, so the attribution mapping can be dropped.
                 session.subagentParentToolUseIds.delete(message.task_id);
+                await this.finalizeRunningTask(
+                  session,
+                  message.session_id,
+                  message.task_id,
+                  message.status === "completed" ? "completed" : "failed",
+                  message.summary,
+                );
                 break;
               case "task_updated":
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
                 // guaranteed per transition — prune on it too so the map can't
                 // grow for the session's lifetime if a notification is skipped.
+                if (message.patch.is_backgrounded === true) {
+                  const runningTask = session.runningTasks.get(message.task_id);
+                  if (runningTask) {
+                    runningTask.backgrounded = true;
+                  }
+                  await this.emitPlan(session, message.session_id);
+                }
                 if (
                   message.patch.status === "completed" ||
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
                   session.subagentParentToolUseIds.delete(message.task_id);
+                  await this.finalizeRunningTask(
+                    session,
+                    message.session_id,
+                    message.task_id,
+                    message.patch.status === "completed" ? "completed" : "failed",
+                  );
                 }
                 break;
               case "worker_shutting_down":
@@ -1872,13 +1998,39 @@ export class ClaudeAcpAgent {
                 break;
               // `control_request_progress` only reports on side_question
               // control requests, which this adapter never issues.
-              // `background_tasks_changed` is a level signal (the full live
-              // background-task set on every membership change) for surfaces
-              // that render a background-activity indicator; turn lifecycle
-              // here is driven by results/idle, so there is nothing to track.
               case "control_request_progress":
-              case "background_tasks_changed":
                 break;
+              case "background_tasks_changed": {
+                // Level signal (the full live background-task set on every
+                // membership change) — REPLACE-reconcile the `backgrounded`
+                // flag against it rather than pairing edges, so a missed
+                // task_started/task_updated bookend can't wedge a stale plan
+                // row. Task removal + card finalization stay owned by the
+                // guaranteed terminal edges (task_notification / terminal
+                // task_updated), so this can only ever add/clear visibility.
+                const live = new Set(message.tasks.map((t) => t.task_id));
+                for (const t of message.tasks) {
+                  const existingTask = session.runningTasks.get(t.task_id);
+                  if (existingTask) {
+                    existingTask.backgrounded = true;
+                    existingTask.type = t.task_type || existingTask.type;
+                    existingTask.description = existingTask.description || t.description;
+                  } else {
+                    session.runningTasks.set(t.task_id, {
+                      taskId: t.task_id,
+                      type: t.task_type,
+                      description: t.description,
+                      skipTranscript: false,
+                      backgrounded: true,
+                    });
+                  }
+                }
+                for (const task of session.runningTasks.values()) {
+                  if (task.backgrounded && !live.has(task.taskId)) task.backgrounded = false;
+                }
+                await this.emitPlan(session, message.session_id);
+                break;
+              }
               default:
                 unreachable(message, this.logger);
                 break;
@@ -1890,6 +2042,13 @@ export class ClaudeAcpAgent {
             // They should not influence the user-turn lifecycle (stop reason,
             // slash-command output forwarding) but their cost is real.
             const isTaskNotification = message.origin?.kind === "task-notification";
+            // `deferred_tool_use` only appears on the `success` subtype — the
+            // narrowing check is required at this point in the union (message
+            // is still `SDKResultSuccess | SDKResultError`). A deferred result
+            // proves the SDK will keep streaming past this result, so it is
+            // not the turn's true end (see `Turn.settleAtIdle`).
+            const isDeferredResult =
+              !isTaskNotification && message.subtype === "success" && !!message.deferred_tool_use;
 
             // Reconcile the Fast mode toggle with the SDK's reported state.
             // Gated to user-driven turns like every other side effect below; a
@@ -1922,7 +2081,15 @@ export class ClaudeAcpAgent {
             // late result after the backstop settled it — get no such settle,
             // so their trailers must be counted here or they'd later be read
             // as the next healthy turn being abandoned and false-fail it.
-            if (!isTaskNotification && (!session.cancelled || !session.activeTurn)) {
+            // A deferred result gets no trailing idle of its own — the SDK's
+            // next idle belongs to the turn's true end, which is either the
+            // eventual final result (already counted there) or, absent one,
+            // the idle that `settleAtIdle` (branch C below) settles directly.
+            if (
+              !isTaskNotification &&
+              !isDeferredResult &&
+              (!session.cancelled || !session.activeTurn)
+            ) {
               owedTrailingIdles++;
             }
 
@@ -2083,7 +2250,18 @@ export class ClaudeAcpAgent {
             // via failActive; cancellation is left to the idle/abort path.
             // settleActive is idempotent, so a duplicate idle is a no-op.
             if (!isTaskNotification && !session.cancelled) {
-              settleActive({ stopReason, usage: sessionUsage(session) });
+              if (isDeferredResult) {
+                // This result is provably not the turn's true end — park the
+                // SUCCESS settle for the turn-over idle instead (branch C in
+                // the idle handler) rather than unlocking the client early or
+                // letting the #825 no-result guard fail it when that idle
+                // arrives.
+                if (session.activeTurn) {
+                  session.activeTurn.settleAtIdle = true;
+                }
+              } else {
+                settleActive({ stopReason, usage: sessionUsage(session) });
+              }
             }
             break;
           }
@@ -2205,6 +2383,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: currentStreamMessageId,
+                runningTasks: session.runningTasks,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -2437,7 +2616,7 @@ export class ClaudeAcpAgent {
               content = message.message.content;
             }
 
-            for (const notification of toAcpNotifications(
+            const notifications = toAcpNotifications(
               content,
               message.message.role,
               params.sessionId,
@@ -2452,7 +2631,17 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
+                runningTasks: session.runningTasks,
               },
+            );
+            // Hold the spawning tool card `in_progress` past a premature
+            // completed/failed tool_result while its background task is still
+            // running (see `Session.runningTaskByToolUseId`). Does not affect
+            // the toolUseCache prune above (already applied inside
+            // `toAcpNotifications`).
+            for (const notification of suppressBackgroundToolResults(
+              notifications,
+              session.runningTaskByToolUseId,
             )) {
               await this.client.sessionUpdate(notification);
             }
@@ -4035,6 +4224,11 @@ export class ClaudeAcpAgent {
     // below) so the TaskCreated/TaskCompleted hook callbacks can close over
     // the same Map that the streaming message handler will read from.
     const taskState: TaskState = new Map();
+    // Per-session background-task tracking (see the `Session.runningTasks`
+    // doc comment). Created here so the TaskCreated/TaskCompleted hook
+    // callbacks below can close over the same Maps the consumer reads/writes.
+    const runningTasks: Map<string, RunningTask> = new Map();
+    const runningTaskByToolUseId: Map<string, string> = new Map();
 
     const options: Options = {
       systemPrompt,
@@ -4162,7 +4356,7 @@ export class ClaudeAcpAgent {
                     sessionId,
                     update: {
                       sessionUpdate: "plan",
-                      entries: taskStateToPlanEntries(taskState),
+                      entries: buildMergedPlanEntries(taskState, runningTasks),
                     },
                   });
                 },
@@ -4181,7 +4375,7 @@ export class ClaudeAcpAgent {
                     sessionId,
                     update: {
                       sessionUpdate: "plan",
-                      entries: taskStateToPlanEntries(taskState),
+                      entries: buildMergedPlanEntries(taskState, runningTasks),
                     },
                   });
                 },
@@ -4457,6 +4651,8 @@ export class ClaudeAcpAgent {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       subagentParentToolUseIds: new Map(),
+      runningTasks,
+      runningTaskByToolUseId,
       messageIdToUuid: new Map(),
     };
 
@@ -5131,14 +5327,12 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
     description: "Opus 4.8 with 1M context",
     family: "opus",
   },
-  { value: "opus", displayName: "Opus 4.8", description: "Opus 4.8", family: "opus" },
   {
     value: "claude-opus-4-7[1m]",
     displayName: "Opus 4.7 1M",
     description: "Opus 4.7 with 1M context",
     family: "opus",
   },
-  { value: "claude-opus-4-7", displayName: "Opus 4.7", description: "Opus 4.7", family: "opus" },
   {
     value: "claude-opus-4-6[1m]",
     displayName: "Opus 4.6 1M",
@@ -5691,9 +5885,14 @@ export function toAcpNotifications(
     // into a single message. Omit it (leave undefined) when unknown — never send
     // an explicit `null`.
     messageId?: string;
+    // Live background tasks (fork addition) so streamed TodoWrite/Task* plan
+    // emits union in one `in_progress` row per backgrounded task. Read-only —
+    // this function never mutates it. Omit for a todos-only plan.
+    runningTasks?: ReadonlyMap<string, RunningTask>;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
+  const runningTasks = options?.runningTasks ?? new Map<string, RunningTask>();
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
@@ -5776,7 +5975,10 @@ export function toAcpNotifications(
           if (Array.isArray(chunk.input?.todos)) {
             update = {
               sessionUpdate: "plan",
-              entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
+              entries: [
+                ...planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
+                ...runningTaskPlanEntries(runningTasks),
+              ],
             };
           }
         } else if (isTaskTool(chunk.name)) {
@@ -5965,7 +6167,7 @@ export function toAcpNotifications(
           if (!isError && (toolUse.name === "TaskCreate" || toolUse.name === "TaskUpdate")) {
             update = {
               sessionUpdate: "plan",
-              entries: taskStateToPlanEntries(taskState),
+              entries: buildMergedPlanEntries(taskState, runningTasks),
             };
           }
         } else if (toolUse.name !== "TodoWrite") {
@@ -6067,6 +6269,11 @@ export function streamEventToAcpNotifications(
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
     messageId?: string;
+    // Live background tasks (fork addition), forwarded verbatim into both
+    // internal `toAcpNotifications` calls below so a streamed TodoWrite/Task*
+    // plan emit unions in the running-task rows. See `toAcpNotifications`'s
+    // own `runningTasks` doc comment.
+    runningTasks?: ReadonlyMap<string, RunningTask>;
   },
 ): SessionNotification[] {
   const event = message.event;
@@ -6087,6 +6294,7 @@ export function streamEventToAcpNotifications(
           taskState: options?.taskState,
           emittedToolCalls: options?.emittedToolCalls,
           messageId: options?.messageId,
+          runningTasks: options?.runningTasks,
         },
       );
     case "content_block_delta":
@@ -6105,6 +6313,7 @@ export function streamEventToAcpNotifications(
           taskState: options?.taskState,
           emittedToolCalls: options?.emittedToolCalls,
           messageId: options?.messageId,
+          runningTasks: options?.runningTasks,
         },
       );
     // No content. `ping` is a Messages-API keep-alive event that the SDK's
