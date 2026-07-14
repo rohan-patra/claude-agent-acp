@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { makeMockQuery } from "./helpers.js";
 
 const { querySpy } = vi.hoisted(() => ({
   querySpy: vi.fn(),
@@ -34,7 +35,7 @@ describe("ClaudeAcpAgent settings", () => {
     const setModelSpy = vi.fn();
     querySpy.mockImplementation(({ options }: any) => {
       capturedOptions = options;
-      return {
+      return makeMockQuery({
         initializationResult: async () => ({
           models: [
             {
@@ -45,8 +46,7 @@ describe("ClaudeAcpAgent settings", () => {
           ],
         }),
         setModel: setModelSpy,
-        supportedCommands: async () => [],
-      } as any;
+      }) as any;
     });
     return { getCapturedOptions: () => capturedOptions, setModelSpy };
   }
@@ -239,12 +239,11 @@ describe("ClaudeAcpAgent settings", () => {
       const setPermissionModeSpy = vi.fn();
       querySpy.mockImplementation(({ options }: any) => {
         capturedOptions = options;
-        return {
+        return makeMockQuery({
           initializationResult: async () => ({ models }),
           setModel: setModelSpy,
           setPermissionMode: setPermissionModeSpy,
-          supportedCommands: async () => [],
-        } as any;
+        }) as any;
       });
       return {
         getCapturedOptions: () => capturedOptions,
@@ -402,11 +401,10 @@ describe("ClaudeAcpAgent settings", () => {
     } {
       const setModelSpy = vi.fn();
       querySpy.mockImplementation(() => {
-        return {
+        return makeMockQuery({
           initializationResult: async () => ({ models }),
           setModel: setModelSpy,
-          supportedCommands: async () => [],
-        } as any;
+        }) as any;
       });
       return { setModelSpy };
     }
@@ -892,7 +890,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const setModelSpy = vi.fn();
     querySpy.mockImplementation(({ options: _options }: any) => {
-      return {
+      return makeMockQuery({
         initializationResult: async () => ({
           models: [
             {
@@ -908,8 +906,7 @@ describe("ClaudeAcpAgent settings", () => {
           ],
         }),
         setModel: setModelSpy,
-        supportedCommands: async () => [],
-      } as any;
+      }) as any;
     });
 
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
@@ -944,7 +941,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const setModelSpy = vi.fn();
     querySpy.mockImplementation(() => {
-      return {
+      return makeMockQuery({
         initializationResult: async () => ({
           models: [
             { value: "default", displayName: "Default", description: "" },
@@ -953,8 +950,7 @@ describe("ClaudeAcpAgent settings", () => {
           ],
         }),
         setModel: setModelSpy,
-        supportedCommands: async () => [],
-      } as any;
+      }) as any;
     });
 
     try {
@@ -998,7 +994,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     const setModelSpy = vi.fn();
     querySpy.mockImplementation(() => {
-      return {
+      return makeMockQuery({
         initializationResult: async () => ({
           models: [
             { value: "default", displayName: "Default", description: "" },
@@ -1006,8 +1002,7 @@ describe("ClaudeAcpAgent settings", () => {
           ],
         }),
         setModel: setModelSpy,
-        supportedCommands: async () => [],
-      } as any;
+      }) as any;
     });
 
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
