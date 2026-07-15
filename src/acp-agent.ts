@@ -6376,11 +6376,107 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   // donates flags from the SDK `default` (flagship) template via family "opus".
   { value: "fable", displayName: "Fable 5", description: "Fable 5", family: "opus" },
   {
+    value: "gpt-5.6-sol",
+    displayName: "GPT-5.6 Sol",
+    description: "Flagship OpenAI model for complex, long-horizon agentic workflows and deep reasoning",
+    family: "custom",
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+    },
+  },
+  {
     value: "opus[1m]",
     displayName: "Opus 4.8 1M",
     description: "Opus 4.8 with 1M context",
     family: "opus",
   },
+  {
+    value: "gpt-5.6-terra",
+    displayName: "GPT-5.6 Terra",
+    description: "Balanced, cost-effective OpenAI model for standard coding and agentic workflows",
+    family: "custom",
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+    },
+  },
+  {
+    value: "sonnet",
+    displayName: "Sonnet 5 1M",
+    description: "Sonnet 5 with 1M context",
+    family: "sonnet",
+  },
+  {
+    value: "gpt-5.6-luna",
+    displayName: "GPT-5.6 Luna",
+    description: "Fast, low-latency, cost-efficient OpenAI model for high-volume tasks",
+    family: "custom",
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+    },
+  },
+  {
+    value: "gpt-5.3-codex-spark",
+    displayName: "GPT-5.3 Codex Spark",
+    description: "Ultra-fast OpenAI coding model for real-time diagnostics and inline diffs",
+    family: "custom",
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high", "xhigh"],
+    },
+  },
+  { value: "haiku", displayName: "Haiku 4.5", description: "Haiku 4.5", family: "haiku" },
+  // Non-Anthropic models routed through a custom model provider/proxy. These
+  // have no SDK family template, so capability flags are set explicitly via
+  // `capabilities` rather than donated.
+  {
+    value: "grok-4.5",
+    displayName: "Grok 4.5",
+    description: "xAI frontier reasoning model optimized for software engineering and agentic workflows",
+    family: "custom",
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high"],
+    },
+  },
+  {
+    value: "composer-2.5",
+    displayName: "Composer 2.5",
+    description: "Cursor's in-house agentic coding model for multi-file planning, editing, and debugging",
+    family: "custom",
+    capabilities: {},
+  },
+  {
+    value: "auto",
+    displayName: "Cursor Auto",
+    description: "Cursor's model-routing option — picks the most cost-effective and reliable model per task",
+    family: "custom",
+    capabilities: {},
+  },
+  {
+    value: "gemini-3.1-pro",
+    displayName: "Gemini 3.1 Pro",
+    description: "Balanced mid-tier Google multimodal model with a 1M-token context window for deep reasoning",
+    family: "custom",
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+    },
+  },
+  {
+    value: "gemini-3.5-flash",
+    displayName: "Gemini 3.5 Flash",
+    description: "Lightweight, high-speed Google multimodal model for fast-turnaround, high-throughput tasks",
+    family: "custom",
+    capabilities: {
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+    },
+  },
+  // Older same-family variants, kept selectable but ranked below their
+  // newer sibling and the rest of the picker.
   {
     value: "claude-opus-4-7[1m]",
     displayName: "Opus 4.7 1M",
@@ -6394,50 +6490,10 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
     family: "opus",
   },
   {
-    value: "sonnet",
-    displayName: "Sonnet 5 1M",
-    description: "Sonnet 5 with 1M context",
-    family: "sonnet",
-  },
-  {
     value: "claude-sonnet-4-6",
     displayName: "Sonnet 4.6",
     description: "Sonnet 4.6",
     family: "sonnet",
-  },
-  { value: "haiku", displayName: "Haiku 4.5", description: "Haiku 4.5", family: "haiku" },
-  // Non-Anthropic models routed through a custom model provider/proxy. These
-  // have no SDK family template, so capability flags are set explicitly via
-  // `capabilities` rather than donated.
-  {
-    value: "gpt-5.6-sol",
-    displayName: "GPT-5.6 Sol",
-    description: "Flagship OpenAI model for complex, long-horizon agentic workflows and deep reasoning",
-    family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-    },
-  },
-  {
-    value: "gpt-5.6-terra",
-    displayName: "GPT-5.6 Terra",
-    description: "Balanced, cost-effective OpenAI model for standard coding and agentic workflows",
-    family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-    },
-  },
-  {
-    value: "gpt-5.6-luna",
-    displayName: "GPT-5.6 Luna",
-    description: "Fast, low-latency, cost-efficient OpenAI model for high-volume tasks",
-    family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-    },
   },
   {
     value: "gpt-5.5",
@@ -6467,60 +6523,6 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
     capabilities: {
       supportsEffort: true,
       supportedEffortLevels: ["low", "medium", "high", "xhigh"],
-    },
-  },
-  {
-    value: "gpt-5.3-codex-spark",
-    displayName: "GPT-5.3 Codex Spark",
-    description: "Ultra-fast OpenAI coding model for real-time diagnostics and inline diffs",
-    family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high", "xhigh"],
-    },
-  },
-  {
-    value: "grok-4.5",
-    displayName: "Grok 4.5",
-    description: "xAI frontier reasoning model optimized for software engineering and agentic workflows",
-    family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high"],
-    },
-  },
-  {
-    value: "composer-2.5",
-    displayName: "Composer 2.5",
-    description: "Cursor's in-house agentic coding model for multi-file planning, editing, and debugging",
-    family: "custom",
-    capabilities: {},
-  },
-  {
-    value: "auto",
-    displayName: "Cursor Auto",
-    description: "Cursor's model-routing option — picks the most cost-effective and reliable model per task",
-    family: "custom",
-    capabilities: {},
-  },
-  {
-    value: "gemini-3.5-flash",
-    displayName: "Gemini 3.5 Flash",
-    description: "Lightweight, high-speed Google multimodal model for fast-turnaround, high-throughput tasks",
-    family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-    },
-  },
-  {
-    value: "gemini-3.1-pro",
-    displayName: "Gemini 3.1 Pro",
-    description: "Balanced mid-tier Google multimodal model with a 1M-token context window for deep reasoning",
-    family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
     },
   },
 ];
