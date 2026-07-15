@@ -44,10 +44,48 @@ describe("buildForkModelList", () => {
       ["opus[1m]", "Opus 4.8 1M"],
       ["claude-opus-4-7[1m]", "Opus 4.7 1M"],
       ["claude-opus-4-6[1m]", "Opus 4.6 1M"],
-      ["sonnet", "Sonnet 5"],
+      ["sonnet", "Sonnet 5 1M"],
       ["claude-sonnet-4-6", "Sonnet 4.6"],
       ["haiku", "Haiku 4.5"],
+      ["gpt-5.6-sol", "GPT-5.6 Sol"],
+      ["gpt-5.6-terra", "GPT-5.6 Terra"],
+      ["gpt-5.6-luna", "GPT-5.6 Luna"],
+      ["gpt-5.5", "GPT-5.5"],
+      ["gpt-5.4", "GPT-5.4"],
+      ["gpt-5.4-mini", "GPT-5.4 mini"],
+      ["gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"],
+      ["grok-4.5", "Grok 4.5"],
+      ["composer-2.5", "Composer 2.5"],
+      ["auto", "Cursor Auto"],
+      ["gemini-3.5-flash", "Gemini 3.5 Flash"],
+      ["gemini-3.1-pro", "Gemini 3.1 Pro"],
     ]);
+  });
+
+  it("uses explicit capabilities for custom (non-Anthropic) models, bypassing SDK family templates", () => {
+    const models = buildForkModelList(SDK_MODELS);
+
+    const sol = models.find((m) => m.value === "gpt-5.6-sol")!;
+    expect(sol.supportsEffort).toBe(true);
+    expect(sol.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(sol.supportsFastMode).toBeUndefined();
+    expect(sol.supportsAutoMode).toBeUndefined();
+
+    const gpt55 = models.find((m) => m.value === "gpt-5.5")!;
+    expect(gpt55.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh"]);
+
+    const grok = models.find((m) => m.value === "grok-4.5")!;
+    expect(grok.supportedEffortLevels).toEqual(["low", "medium", "high"]);
+
+    const gemini = models.find((m) => m.value === "gemini-3.1-pro")!;
+    expect(gemini.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
+
+    const auto = models.find((m) => m.value === "auto")!;
+    expect(auto.supportsEffort).toBeUndefined();
+    expect(auto.supportedEffortLevels).toBeUndefined();
+
+    const composer = models.find((m) => m.value === "composer-2.5")!;
+    expect(composer.supportsEffort).toBeUndefined();
   });
 
   it("donates Opus capability flags from the SDK `default` template to every Opus entry", () => {

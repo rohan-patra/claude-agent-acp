@@ -560,6 +560,18 @@ describe("ClaudeAcpAgent settings", () => {
         "sonnet",
         "claude-sonnet-4-6",
         "haiku",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "grok-4.5",
+        "composer-2.5",
+        "auto",
+        "gemini-3.5-flash",
+        "gemini-3.1-pro",
       ]);
     });
 
