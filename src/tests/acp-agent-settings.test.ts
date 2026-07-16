@@ -314,6 +314,43 @@ describe("ClaudeAcpAgent settings", () => {
       expect(modeIds).toContain("auto");
     });
 
+    it("includes `auto` when the resolved model is a fork custom (non-Anthropic) entry", async () => {
+      // Custom picker entries have no SDK family template; buildForkModelList
+      // still forces supportsAutoMode so Auto appears in session modes (and
+      // therefore ExitPlanMode post-plan approval options).
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ model: "gpt-5.6-sol" }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Opus",
+          supportsAutoMode: true,
+        },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      expect(modelOption.currentValue).toBe("gpt-5.6-sol");
+      const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
+      expect(modeIds).toContain("auto");
+    });
+
     it("clamps permissions.defaultMode='auto' to 'default' on a model that lacks supportsAutoMode", async () => {
       await fs.promises.writeFile(
         path.join(tempDir, "settings.json"),

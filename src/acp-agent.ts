@@ -6363,6 +6363,9 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   // Only present for family "custom" — these entries aren't Claude models, so
   // there's no SDK family template to donate capability flags from. Set
   // explicitly instead of being resolved via `pickTemplate`/fallback.
+  // `supportsAutoMode` is forced on for every custom entry in
+  // `buildForkModelList` (even when omitted here) so Auto appears in session
+  // modes and ExitPlanMode post-plan approval.
   capabilities?: Pick<
     ModelInfo,
     | "supportsEffort"
@@ -6587,9 +6590,13 @@ export function buildForkModelList(sdkModels: ModelInfo[]): ModelInfo[] {
 
   return FORK_MODEL_PICKER.map(({ value, displayName, description, family, capabilities }) => {
     // "custom" entries (non-Anthropic models) have no SDK family template to
-    // donate flags from — use the explicit `capabilities` given inline.
+    // donate flags from — use the explicit `capabilities` given inline, and
+    // always advertise Auto mode so session modes / ExitPlanMode post-plan
+    // approval can offer it (gated solely by `supportsAutoMode === true`).
     const caps =
-      family === "custom" ? (capabilities ?? {}) : (pickTemplate(family) ?? FORK_MODEL_CAPABILITY_FALLBACK[family]);
+      family === "custom"
+        ? { ...(capabilities ?? {}), supportsAutoMode: true }
+        : (pickTemplate(family) ?? FORK_MODEL_CAPABILITY_FALLBACK[family]);
     return {
       value,
       displayName,

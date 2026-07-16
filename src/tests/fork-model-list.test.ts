@@ -69,7 +69,7 @@ describe("buildForkModelList", () => {
     expect(sol.supportsEffort).toBe(true);
     expect(sol.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(sol.supportsFastMode).toBeUndefined();
-    expect(sol.supportsAutoMode).toBeUndefined();
+    expect(sol.supportsAutoMode).toBe(true);
 
     const gpt55 = models.find((m) => m.value === "gpt-5.5")!;
     expect(gpt55.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh"]);
@@ -86,6 +86,30 @@ describe("buildForkModelList", () => {
 
     const composer = models.find((m) => m.value === "composer-2.5")!;
     expect(composer.supportsEffort).toBeUndefined();
+  });
+
+  it("advertises supportsAutoMode on every custom (non-Anthropic) picker entry", () => {
+    const models = buildForkModelList(SDK_MODELS);
+    const customValues = [
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.3-codex-spark",
+      "grok-4.5",
+      "composer-2.5",
+      "auto",
+      "gemini-3.1-pro",
+      "gemini-3.5-flash",
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+    ];
+    for (const value of customValues) {
+      const m = models.find((x) => x.value === value)!;
+      expect(m.supportsAutoMode, value).toBe(true);
+    }
+    // Anthropic-family gating is unchanged: Haiku still omits Auto.
+    expect(models.find((m) => m.value === "haiku")!.supportsAutoMode).toBeUndefined();
   });
 
   it("donates Opus capability flags from the SDK `default` template to every Opus entry", () => {
