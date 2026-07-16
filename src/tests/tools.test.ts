@@ -14,11 +14,17 @@ import {
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { AcpClient, toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
+import { spawnSync } from "node:child_process";
 import {
+  createCwdChangedWatchHook,
+  createFileChangedHook,
   createFileEditInterceptor,
-  toolUpdateFromToolResult,
+  createPostToolUseFailureHook,
   createPostToolUseHook,
+  createPreToolUseHook,
+  createSessionStartWatchHook,
   createTaskHook,
+  toolUpdateFromToolResult,
   toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
@@ -2964,5 +2970,668 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
 
       expect((update.content?.[0] as any).content.text).toContain("Web search results for query");
     });
+  });
+});
+
+describe("tracked file watcher", () => {
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  function initGitRepo(dir: string) {
+    const run = (args: string[]) => {
+      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      if (result.status !== 0) {
+        throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+      }
+    };
+    run(["init"]);
+    run(["config", "user.email", "test@example.com"]);
+    run(["config", "user.name", "Test"]);
+  }
+
+  async function createTrackedInterceptor(dir: string) {
+    const interceptor = createFileEditInterceptor(mockLogger, dir);
+    const active = await interceptor.initializeTrackedFileWatch();
+    return { interceptor, active };
+  }
+
+  it("preserves dirty working-tree content as the startup baseline (not HEAD)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-dirty-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "tracked.txt");
+      fs.writeFileSync(filePath, "committed\n");
+      spawnSync("git", ["add", "tracked.txt"], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+      fs.writeFileSync(filePath, "dirty working tree\n");
+
+      const { interceptor, active } = await createTrackedInterceptor(tmpDir);
+      expect(active).toBe(true);
+
+      const writeTextFile = vi.fn(async () => {});
+      fs.writeFileSync(filePath, "agent change\n");
+      await interceptor.onFileChanged("change", filePath, writeTextFile);
+
+      expect(writeTextFile).toHaveBeenCalledTimes(1);
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "agent change\n");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("dirty working tree\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reverts a tracked UTF-8 change and routes it exactly once", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-once-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "a.txt");
+      fs.writeFileSync(filePath, "baseline\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+      fs.writeFileSync(filePath, "changed\n");
+      await interceptor.onFileChanged("change", filePath, writeTextFile);
+      await interceptor.onFileChanged("change", filePath, writeTextFile);
+
+      expect(writeTextFile).toHaveBeenCalledTimes(1);
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "changed\n");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("baseline\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips untracked, post-start git-add, outside-cwd, .context, binary, invalid-utf8, symlink, unreadable", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-skip-"));
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-out-"));
+    try {
+      initGitRepo(tmpDir);
+      const tracked = path.join(tmpDir, "tracked.txt");
+      fs.writeFileSync(tracked, "ok\n");
+      const contextFile = path.join(tmpDir, ".context", "plans", "p.md");
+      fs.mkdirSync(path.dirname(contextFile), { recursive: true });
+      fs.writeFileSync(contextFile, "plan\n");
+      spawnSync("git", ["add", "tracked.txt"], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+
+      const untracked = path.join(tmpDir, "untracked.txt");
+      fs.writeFileSync(untracked, "x\n");
+      await interceptor.onFileChanged("add", untracked, writeTextFile);
+
+      const lateTracked = path.join(tmpDir, "late.txt");
+      fs.writeFileSync(lateTracked, "late\n");
+      spawnSync("git", ["add", "late.txt"], { cwd: tmpDir });
+      await interceptor.onFileChanged("add", lateTracked, writeTextFile);
+
+      const outside = path.join(outsideDir, "out.txt");
+      fs.writeFileSync(outside, "out\n");
+      await interceptor.onFileChanged("change", outside, writeTextFile);
+
+      await interceptor.onFileChanged("change", contextFile, writeTextFile);
+
+      // Pretend a tracked path became binary — use a fresh tracked file
+      const binTracked = path.join(tmpDir, "binary.txt");
+      fs.writeFileSync(binTracked, "text\n");
+      spawnSync("git", ["add", "binary.txt"], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "bin"], { cwd: tmpDir });
+      const { interceptor: interceptor2 } = await createTrackedInterceptor(tmpDir);
+      fs.writeFileSync(binTracked, Buffer.from([0x68, 0x00, 0x69]));
+      await interceptor2.onFileChanged("change", binTracked, writeTextFile);
+
+      const badUtf = path.join(tmpDir, "bad.txt");
+      fs.writeFileSync(badUtf, "text\n");
+      spawnSync("git", ["add", "bad.txt"], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "bad"], { cwd: tmpDir });
+      const { interceptor: interceptor3 } = await createTrackedInterceptor(tmpDir);
+      fs.writeFileSync(badUtf, Buffer.from([0xff, 0xfe, 0xfd]));
+      await interceptor3.onFileChanged("change", badUtf, writeTextFile);
+
+      const linkTarget = path.join(tmpDir, "link-target.txt");
+      const linkPath = path.join(tmpDir, "link.txt");
+      fs.writeFileSync(linkTarget, "target\n");
+      fs.writeFileSync(linkPath, "was file\n");
+      spawnSync("git", ["add", "link.txt", "link-target.txt"], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "link"], { cwd: tmpDir });
+      const { interceptor: interceptor4 } = await createTrackedInterceptor(tmpDir);
+      fs.unlinkSync(linkPath);
+      fs.symlinkSync(linkTarget, linkPath);
+      await interceptor4.onFileChanged("change", linkPath, writeTextFile);
+
+      const unreadable = path.join(tmpDir, "secret.txt");
+      fs.writeFileSync(unreadable, "secret\n");
+      spawnSync("git", ["add", "secret.txt"], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "secret"], { cwd: tmpDir });
+      const { interceptor: interceptor5 } = await createTrackedInterceptor(tmpDir);
+      fs.chmodSync(unreadable, 0);
+      try {
+        await interceptor5.onFileChanged("change", unreadable, writeTextFile);
+      } finally {
+        fs.chmodSync(unreadable, 0o644);
+      }
+
+      expect(writeTextFile).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores unlink and never invokes ACP; atomic unlink→add may still surface final content", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-unlink-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "baseline\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+
+      fs.unlinkSync(filePath);
+      await interceptor.onFileChanged("unlink", filePath, writeTextFile);
+      expect(fs.existsSync(filePath)).toBe(false);
+      expect(writeTextFile).not.toHaveBeenCalled();
+
+      fs.writeFileSync(filePath, "replaced\n");
+      await interceptor.onFileChanged("add", filePath, writeTextFile);
+      expect(writeTextFile).toHaveBeenCalledTimes(1);
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "replaced\n");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("baseline\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("debounces rapid same-path events to one proposal and keeps different paths independent", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-debounce-"));
+    try {
+      initGitRepo(tmpDir);
+      const a = path.join(tmpDir, "a.txt");
+      const b = path.join(tmpDir, "b.txt");
+      fs.writeFileSync(a, "a0\n");
+      fs.writeFileSync(b, "b0\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+
+      fs.writeFileSync(a, "a1\n");
+      const p1 = interceptor.onFileChanged("change", a, writeTextFile);
+      fs.writeFileSync(a, "a2\n");
+      const p2 = interceptor.onFileChanged("change", a, writeTextFile);
+      fs.writeFileSync(b, "b1\n");
+      const p3 = interceptor.onFileChanged("change", b, writeTextFile);
+      await Promise.all([p1, p2, p3]);
+
+      expect(writeTextFile).toHaveBeenCalledTimes(2);
+      expect(writeTextFile).toHaveBeenCalledWith(a, "a2\n");
+      expect(writeTextFile).toHaveBeenCalledWith(b, "b1\n");
+      expect(fs.readFileSync(a, "utf8")).toBe("a0\n");
+      expect(fs.readFileSync(b, "utf8")).toBe("b0\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // Zed's `write_text_file` persists the proposed content to disk immediately
+  // (it ends in `save_buffer`), and on reject it restores the pre-proposal
+  // content to disk (also `save_buffer`); accept writes nothing. This mock
+  // reproduces the persist-on-route half so the accept/reject inference is
+  // exercised against Zed's real behavior rather than a no-op stub.
+  const zedWriteTextFile = () =>
+    vi.fn(async (p: string, content: string) => {
+      fs.writeFileSync(p, content);
+    });
+
+  it("accept: routing write and acceptance keep the proposal committed and revert future changes to it", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-accept-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "baseline\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const zedWrite = zedWriteTextFile();
+
+      // A non-tool process writes new content; the watcher reverts to the
+      // baseline and routes the proposal. Zed persists the proposal to disk.
+      fs.writeFileSync(filePath, "proposed\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(zedWrite).toHaveBeenCalledWith(filePath, "proposed\n");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("proposed\n");
+
+      // Zed's own routing write fires a FileChanged echo → recognized as the
+      // proposal on disk, not a new change.
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+
+      // User accepts: no disk write, no event. A later genuine change must revert
+      // to the accepted content ("proposed"), not the original baseline.
+      fs.writeFileSync(filePath, "proposed2\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(2);
+      expect(zedWrite).toHaveBeenLastCalledWith(filePath, "proposed2\n");
+
+      // Reject proposed2 → Zed restores the reject target, which is the
+      // previously-accepted "proposed" (proving committed advanced on accept),
+      // and the watcher does not re-propose.
+      fs.writeFileSync(filePath, "proposed\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(2);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("proposed\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reject: rolls back to the reject target and reverts future changes to it, not the rejected proposal", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-reject-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "baseline\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const zedWrite = zedWriteTextFile();
+
+      fs.writeFileSync(filePath, "proposed\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("proposed\n");
+
+      // Routing echo — no new proposal.
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+
+      // User rejects: Zed restores the reject target ("baseline") to disk. The
+      // watcher recognizes it and does not re-propose the reverse.
+      fs.writeFileSync(filePath, "baseline\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("baseline\n");
+
+      // A later genuine change reverts to the reject target ("baseline"), not the
+      // rejected "proposed".
+      fs.writeFileSync(filePath, "proposed3\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(2);
+      expect(zedWrite).toHaveBeenLastCalledWith(filePath, "proposed3\n");
+
+      fs.writeFileSync(filePath, "baseline\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(2);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("baseline\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("restores agent-written content when ACP writeTextFile fails", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-acp-fail-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "baseline\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const writeTextFile = vi.fn(async () => {
+        throw new Error("acp down");
+      });
+
+      fs.writeFileSync(filePath, "agent\n");
+      await interceptor.onFileChanged("change", filePath, writeTextFile);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("agent\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("built-in Edit then reject: watcher recognizes Zed's restore and does not re-propose the reverse", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-edit-reject-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "baseline\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const zedWrite = zedWriteTextFile();
+
+      // Built-in Edit: the tool writes to disk, then interceptEditWrite reverts and
+      // routes through Zed (which persists the edit to disk).
+      interceptor.markExplicitMutation(filePath);
+      interceptor.onFileRead(filePath, "baseline\n");
+      fs.writeFileSync(filePath, "edited\n");
+      await interceptor.interceptEditWrite(
+        "Edit",
+        { file_path: filePath, old_string: "baseline\n", new_string: "edited\n" },
+        { success: true, error: null },
+        zedWrite,
+      );
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(zedWrite).toHaveBeenCalledWith(filePath, "edited\n");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("edited\n");
+
+      // Zed's routing write echo — recognized as the proposal, not a new change.
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+
+      // User rejects the built-in edit in Zed → Zed restores "baseline". The
+      // watcher must recognize the reject target and NOT re-propose the reverse.
+      fs.writeFileSync(filePath, "baseline\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("baseline\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // Zed's `write_text_file` runs format-on-save before saving, so the content it
+  // persists to disk can differ from what was routed. This mock reproduces that
+  // by upper-casing on save; the watcher must adopt the reformatted content as a
+  // single proposal (not re-propose it) and still reject to the original.
+  const zedFormatOnSaveWriteTextFile = () =>
+    vi.fn(async (p: string, content: string) => {
+      fs.writeFileSync(p, content.toUpperCase());
+    });
+
+  it("format-on-save: adopts Zed's reformatted content as one proposal and rejects to the original", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-fmt-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "base\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const zedWrite = zedFormatOnSaveWriteTextFile();
+
+      // External change routed; Zed persists the reformatted (upper-cased) result.
+      fs.writeFileSync(filePath, "proposed\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("PROPOSED\n");
+
+      // Zed's reformatted save fires an echo → adopted as the proposal, NOT
+      // re-proposed (no double proposal, no formatter loop).
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("PROPOSED\n");
+
+      // Reject → Zed restores the reject target, which is the ORIGINAL "base"
+      // (not the reformatted proposal), and the watcher does not re-propose.
+      fs.writeFileSync(filePath, "base\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("base\n");
+
+      // A later genuine change routes from the reject target.
+      fs.writeFileSync(filePath, "next\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(2);
+      expect(zedWrite).toHaveBeenLastCalledWith(filePath, "next\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("built-in Edit with format-on-save: one proposal, reject restores the original", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-edit-fmt-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "base\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const zedWrite = zedFormatOnSaveWriteTextFile();
+
+      interceptor.markExplicitMutation(filePath);
+      interceptor.onFileRead(filePath, "base\n");
+      fs.writeFileSync(filePath, "edited\n");
+      await interceptor.interceptEditWrite(
+        "Edit",
+        { file_path: filePath, old_string: "base\n", new_string: "edited\n" },
+        { success: true, error: null },
+        zedWrite,
+      );
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("EDITED\n");
+
+      // Zed's reformatted save echo → adopted, not re-proposed.
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("EDITED\n");
+
+      // Reject → Zed restores the original "base".
+      fs.writeFileSync(filePath, "base\n");
+      await interceptor.onFileChanged("change", filePath, zedWrite);
+      expect(zedWrite).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("base\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("Edit/Write plus watcher notifications yield exactly one ACP proposal and clear suppression after failures", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-edit-"));
+    try {
+      initGitRepo(tmpDir);
+      const filePath = path.join(tmpDir, "t.txt");
+      fs.writeFileSync(filePath, "baseline\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+
+      interceptor.markExplicitMutation(filePath);
+      interceptor.onFileRead(filePath, "baseline\n");
+      fs.writeFileSync(filePath, "from-edit\n");
+      const watchPromise = interceptor.onFileChanged("change", filePath, writeTextFile);
+
+      await interceptor.interceptEditWrite(
+        "Edit",
+        { file_path: filePath, old_string: "baseline\n", new_string: "from-edit\n" },
+        { success: true, error: null },
+        writeTextFile,
+      );
+      await watchPromise;
+
+      expect(writeTextFile).toHaveBeenCalledTimes(1);
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "from-edit\n");
+      expect(fs.readFileSync(filePath, "utf8")).toBe("baseline\n");
+
+      // Failure path clears marker so later watcher changes work
+      interceptor.markExplicitMutation(filePath);
+      const failHook = createPostToolUseFailureHook({
+        onEditWriteFailure: (p) => interceptor.clearExplicitMutation(p),
+      });
+      await failHook(
+        {
+          hook_event_name: "PostToolUseFailure",
+          tool_name: "Edit",
+          tool_input: { file_path: filePath },
+          tool_use_id: "t1",
+          error: "boom",
+          session_id: "s",
+          transcript_path: "/tmp",
+          cwd: tmpDir,
+        } as any,
+        "t1",
+        { signal: AbortSignal.abort() },
+      );
+
+      fs.writeFileSync(filePath, "after-fail\n");
+      await interceptor.onFileChanged("change", filePath, writeTextFile);
+      expect(writeTextFile).toHaveBeenCalledTimes(2);
+      expect(writeTextFile).toHaveBeenLastCalledWith(filePath, "after-fail\n");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("Write new-file behavior is preserved and does not depend on the watcher", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-write-new-"));
+    try {
+      initGitRepo(tmpDir);
+      spawnSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: tmpDir });
+      const { interceptor } = await createTrackedInterceptor(tmpDir);
+      const writeTextFile = vi.fn(async () => {});
+      const filePath = path.join(tmpDir, "brand-new.txt");
+
+      interceptor.onPreWrite(filePath);
+      interceptor.markExplicitMutation(filePath);
+      fs.writeFileSync(filePath, "fresh\n");
+      await interceptor.interceptEditWrite(
+        "Write",
+        { file_path: filePath, content: "fresh\n" },
+        { success: true, error: null },
+        writeTextFile,
+      );
+
+      expect(writeTextFile).toHaveBeenCalledWith(filePath, "fresh\n");
+      expect(fs.existsSync(filePath)).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("watcher hook helpers compose, return watchPaths, ignore unlink, and stay inactive without git", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-watch-hooks-"));
+    const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-nongit-"));
+    try {
+      initGitRepo(tmpDir);
+      fs.writeFileSync(path.join(tmpDir, "t.txt"), "x\n");
+      spawnSync("git", ["add", "."], { cwd: tmpDir });
+      spawnSync("git", ["commit", "-m", "init"], { cwd: tmpDir });
+
+      const { interceptor, active } = await createTrackedInterceptor(tmpDir);
+      expect(active).toBe(true);
+
+      const sessionHook = createSessionStartWatchHook(() =>
+        interceptor.isWatchActive() ? [tmpDir] : undefined,
+      );
+      const sessionOut = await sessionHook(
+        {
+          hook_event_name: "SessionStart",
+          source: "startup",
+          session_id: "s",
+          transcript_path: "/tmp",
+          cwd: tmpDir,
+        } as any,
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+      expect((sessionOut as any).hookSpecificOutput.watchPaths).toEqual([tmpDir]);
+
+      const seen: Array<{ event: string; path: string }> = [];
+      const fileHook = createFileChangedHook(async (event, filePath) => {
+        seen.push({ event, path: filePath });
+      });
+      await fileHook(
+        {
+          hook_event_name: "FileChanged",
+          event: "unlink",
+          file_path: path.join(tmpDir, "t.txt"),
+          session_id: "s",
+          transcript_path: "/tmp",
+          cwd: tmpDir,
+        } as any,
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+      expect(seen).toEqual([]);
+
+      await fileHook(
+        {
+          hook_event_name: "FileChanged",
+          event: "change",
+          file_path: path.join(tmpDir, "t.txt"),
+          session_id: "s",
+          transcript_path: "/tmp",
+          cwd: tmpDir,
+        } as any,
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+      expect(seen).toEqual([{ event: "change", path: path.join(tmpDir, "t.txt") }]);
+
+      const { interceptor: nonGitInterceptor, active: nonGitActive } =
+        await createTrackedInterceptor(nonGit);
+      expect(nonGitActive).toBe(false);
+      expect(nonGitInterceptor.isWatchActive()).toBe(false);
+
+      const cwdHook = createCwdChangedWatchHook(async (newCwd) => {
+        const ok = await interceptor.reinitializeForCwd(newCwd);
+        return ok ? [newCwd] : undefined;
+      });
+      const cwdOut = await cwdHook(
+        {
+          hook_event_name: "CwdChanged",
+          old_cwd: tmpDir,
+          new_cwd: nonGit,
+          session_id: "s",
+          transcript_path: "/tmp",
+          cwd: nonGit,
+        } as any,
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+      expect((cwdOut as any).hookSpecificOutput.watchPaths).toBeUndefined();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(nonGit, { recursive: true, force: true });
+    }
+  });
+
+  it("PreToolUse marks explicit mutations for Edit and Write", async () => {
+    const mark = vi.fn();
+    const hook = createPreToolUseHook({ onExplicitMutation: mark });
+    await hook(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Edit",
+        tool_input: { file_path: "/tmp/x" },
+        tool_use_id: "1",
+        session_id: "s",
+        transcript_path: "/tmp",
+        cwd: "/tmp",
+      } as any,
+      "1",
+      { signal: AbortSignal.abort() },
+    );
+    await hook(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: "/tmp/y" },
+        tool_use_id: "2",
+        session_id: "s",
+        transcript_path: "/tmp",
+        cwd: "/tmp",
+      } as any,
+      "2",
+      { signal: AbortSignal.abort() },
+    );
+    expect(mark).toHaveBeenCalledWith("/tmp/x");
+    expect(mark).toHaveBeenCalledWith("/tmp/y");
   });
 });

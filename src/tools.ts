@@ -60,9 +60,14 @@ import {
   BetaWebFetchToolResultErrorBlock,
   BetaWebSearchToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import { Logger } from "./acp-agent.js";
+
+const execFileAsync = promisify(execFile);
+const TRACKED_FILE_DEBOUNCE_MS = 50;
 
 /**
  * Union of all possible content types that can appear in tool results from the Anthropic SDK.
@@ -1186,12 +1191,88 @@ export const registerHookCallback = (
 
 /* A callback for Claude Code that is called when receiving a PreToolUse hook */
 export const createPreToolUseHook =
-  (options?: { onPreWrite?: (filePath: string) => void }): HookCallback =>
+  (options?: {
+    onPreWrite?: (filePath: string) => void;
+    onExplicitMutation?: (filePath: string) => void;
+  }): HookCallback =>
   async (input: any): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PreToolUse") {
-      if (input.tool_name === "Write" && input.tool_input?.file_path && options?.onPreWrite) {
-        options.onPreWrite(input.tool_input.file_path);
+      const filePath =
+        typeof input.tool_input?.file_path === "string" ? input.tool_input.file_path : undefined;
+      if (filePath && (input.tool_name === "Write" || input.tool_name === "Edit")) {
+        options?.onExplicitMutation?.(filePath);
       }
+      if (input.tool_name === "Write" && filePath && options?.onPreWrite) {
+        options.onPreWrite(filePath);
+      }
+    }
+    return { continue: true };
+  };
+
+/** Clears Edit/Write explicit-mutation markers when the built-in tool fails. */
+export const createPostToolUseFailureHook =
+  (options?: { onEditWriteFailure?: (filePath: string) => void }): HookCallback =>
+  async (input: any): Promise<{ continue: boolean }> => {
+    if (input.hook_event_name === "PostToolUseFailure") {
+      if (
+        (input.tool_name === "Edit" || input.tool_name === "Write") &&
+        input.tool_input?.file_path &&
+        options?.onEditWriteFailure
+      ) {
+        options.onEditWriteFailure(input.tool_input.file_path);
+      }
+    }
+    return { continue: true };
+  };
+
+/** Returns `watchPaths` on SessionStart when the tracked-file watcher is active. */
+export const createSessionStartWatchHook =
+  (getWatchPaths: () => string[] | undefined): HookCallback =>
+  async (input: any) => {
+    if (input.hook_event_name !== "SessionStart") {
+      return { continue: true };
+    }
+    const watchPaths = getWatchPaths();
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "SessionStart" as const,
+        ...(watchPaths ? { watchPaths } : {}),
+      },
+    };
+  };
+
+/** Re-inits the watcher on cwd change and returns updated `watchPaths`. */
+export const createCwdChangedWatchHook =
+  (onCwdChanged: (newCwd: string) => Promise<string[] | undefined>): HookCallback =>
+  async (input: any) => {
+    if (input.hook_event_name !== "CwdChanged") {
+      return { continue: true };
+    }
+    const watchPaths = await onCwdChanged(input.new_cwd);
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "CwdChanged" as const,
+        ...(watchPaths ? { watchPaths } : {}),
+      },
+    };
+  };
+
+/** Forwards non-unlink FileChanged events to the tracked-file coordinator. */
+export const createFileChangedHook =
+  (
+    onFileChanged: (event: "change" | "add", filePath: string) => void | Promise<void>,
+  ): HookCallback =>
+  async (input: any) => {
+    if (input.hook_event_name !== "FileChanged") {
+      return { continue: true };
+    }
+    if (input.event === "unlink") {
+      return { continue: true };
+    }
+    if (input.event === "change" || input.event === "add") {
+      await onFileChanged(input.event, input.file_path);
     }
     return { continue: true };
   };
@@ -1262,6 +1343,11 @@ function isToolError(toolResponse: unknown): boolean {
  * 1. Reverts the file to its pre-edit state on disk
  * 2. Routes the new content through ACP writeTextFile → Zed's Review Changes UI
  * 3. Updates the content cache for consecutive edits
+ *
+ * Also coordinates a Git-tracked-file watcher fallback: net changes to files
+ * that were tracked at session start (from Bash/formatters/MCP/subagents/etc.)
+ * are reverted and re-proposed via the same writeTextFile bridge. Deletions
+ * are out of scope. Built-in Edit/Write remain the authoritative path.
  */
 export interface FileEditInterceptor {
   /** Cache file content when Read completes (via PostToolUse). */
@@ -1275,12 +1361,110 @@ export interface FileEditInterceptor {
     toolResponse: unknown,
     writeTextFile: (path: string, content: string) => Promise<void>,
   ) => Promise<void>;
+  /**
+   * Snapshot Git-tracked working-tree baselines. No-op (and returns false) when
+   * `cwd` is not inside a Git worktree.
+   */
+  initializeTrackedFileWatch: () => Promise<boolean>;
+  /**
+   * Re-snapshot against a new cwd (e.g. CwdChanged). Returns whether watching
+   * should be active for the new cwd.
+   */
+  reinitializeForCwd: (newCwd: string) => Promise<boolean>;
+  /** Whether the tracked-file watcher is active for the current cwd. */
+  isWatchActive: () => boolean;
+  /** Mark a path as undergoing built-in Edit/Write so the watcher stays quiet. */
+  markExplicitMutation: (filePath: string) => void;
+  /** Clear the explicit-mutation marker (PostToolUseFailure / settle). */
+  clearExplicitMutation: (filePath: string) => void;
+  /**
+   * Handle a filesystem watcher observation. `unlink` is a hard no-op.
+   * Coalesces rapid events, serializes per path, and routes net changes through
+   * `writeTextFile` without fabricating tool-call cards.
+   */
+  onFileChanged: (
+    event: "change" | "add" | "unlink",
+    filePath: string,
+    writeTextFile: (path: string, content: string) => Promise<void>,
+  ) => Promise<void>;
+}
+
+/** An outstanding Review Changes proposal awaiting the user's accept/reject. */
+type PendingReview = {
+  /** Content Zed has persisted to disk for this proposal. Zed's `write_text_file`
+   *  ends in `save_buffer`, so seeing it on disk again is that routing write, an
+   *  accept (no further write), or a re-affirmation. Updated by the `settled`
+   *  adopt below when Zed reformats the proposal on save (format-on-save). */
+  proposal: string;
+  /** Content Zed restores to disk if the user rejects (the buffer's pre-proposal
+   *  text — i.e. what disk held when `writeTextFile` was called). Seeing it on
+   *  disk after routing means the user rejected. Held stable across a
+   *  format-on-save adopt so reject still restores correctly. */
+  rejectTarget: string;
+  /** False until the first post-routing disk observation is folded in. Zed may
+   *  reformat the proposal on save (`format_on_save`), so the content it actually
+   *  persists can differ from what we routed; the first such observation is
+   *  adopted as `proposal` (rather than re-proposed) so a formatter can't cause a
+   *  double proposal or, if non-idempotent, an unbounded re-proposal loop. */
+  settled: boolean;
+};
+
+type TrackedPathState = {
+  /** The current reject baseline: the user's last settled/accepted content.
+   *  Advanced optimistically to a proposal at routing time and rolled back to
+   *  `pending.rejectTarget` if a reject is later observed on disk. */
+  committed: string;
+  pending: PendingReview | null;
+  explicitMutation: boolean;
+  debounceGeneration: number;
+  debounceTimer: ReturnType<typeof setTimeout> | null;
+  waiters: Array<() => void>;
+  queue: Promise<void>;
+};
+
+function tryReadTextFileContent(filePath: string): string | null {
+  try {
+    const st = fs.lstatSync(filePath);
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    const buf = fs.readFileSync(filePath);
+    if (buf.includes(0)) return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    return null;
+  }
+}
+
+async function isGitWorktree(cwd: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd,
+      encoding: "utf8",
+    });
+    return stdout.trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+async function listGitTrackedRelativePaths(cwd: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", ["ls-files", "--cached", "-z", "--", "."], {
+    cwd,
+    encoding: "buffer",
+    maxBuffer: 50 * 1024 * 1024,
+  });
+  return stdout
+    .toString("utf8")
+    .split("\0")
+    .filter((p) => p.length > 0);
 }
 
 export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEditInterceptor {
   const fileContentCache = new Map<string, string>();
   const nonExistentFiles = new Set<string>();
-  const resolvedCwd = cwd ? path.resolve(cwd) : undefined;
+  let resolvedCwd = cwd ? path.resolve(cwd) : undefined;
+  const trackedFiles = new Set<string>();
+  const pathStates = new Map<string, TrackedPathState>();
+  let watchActive = false;
 
   // Files outside the project (e.g. ~/.claude/settings.json) and inside .context/
   // should be handled by the native Claude Code tools without routing through ACP.
@@ -1295,6 +1479,181 @@ export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEdi
       return false;
     }
     return true;
+  };
+
+  const normalizePath = (filePath: string): string => path.resolve(filePath);
+
+  const getPathState = (resolvedPath: string): TrackedPathState => {
+    let state = pathStates.get(resolvedPath);
+    if (!state) {
+      state = {
+        committed: "",
+        pending: null,
+        explicitMutation: false,
+        debounceGeneration: 0,
+        debounceTimer: null,
+        waiters: [],
+        queue: Promise.resolve(),
+      };
+      pathStates.set(resolvedPath, state);
+    }
+    return state;
+  };
+
+  const writeDisk = (resolvedPath: string, content: string): void => {
+    fs.writeFileSync(resolvedPath, content);
+  };
+
+  const snapshotTrackedBaselines = async (): Promise<boolean> => {
+    trackedFiles.clear();
+    pathStates.clear();
+    watchActive = false;
+    if (!resolvedCwd) return false;
+    if (!(await isGitWorktree(resolvedCwd))) return false;
+
+    let relativePaths: string[];
+    try {
+      relativePaths = await listGitTrackedRelativePaths(resolvedCwd);
+    } catch (e) {
+      logger.error(`[FileEditInterceptor] git ls-files failed for ${resolvedCwd}: ${e}`);
+      return false;
+    }
+
+    for (const rel of relativePaths) {
+      const abs = normalizePath(path.join(resolvedCwd, rel));
+      if (!isInScope(abs)) continue;
+      const content = tryReadTextFileContent(abs);
+      if (content === null) continue;
+      trackedFiles.add(abs);
+      const state = getPathState(abs);
+      state.committed = content;
+      state.pending = null;
+      state.explicitMutation = false;
+    }
+
+    watchActive = true;
+    return true;
+  };
+
+  const processSettledChange = async (
+    resolvedPath: string,
+    writeTextFile: (path: string, content: string) => Promise<void>,
+  ): Promise<void> => {
+    if (!watchActive || !trackedFiles.has(resolvedPath)) return;
+    if (!isInScope(resolvedPath)) return;
+
+    const state = getPathState(resolvedPath);
+    const content = tryReadTextFileContent(resolvedPath);
+    if (content === null) return;
+
+    // Resolve an outstanding proposal from a later disk observation. Zed
+    // persists the proposed content to disk at `writeTextFile` time and, on
+    // reject, restores the pre-proposal content to disk (both end in
+    // `save_buffer`; verified in Zed's acp_thread/action_log). So after routing,
+    // the disk lands on either the proposal (routing write / accept / re-affirm)
+    // or the reject target (user rejected) — infer from which.
+    const pending = state.pending;
+    if (pending) {
+      if (content === pending.rejectTarget) {
+        // Disk restored to the pre-proposal content: the user rejected. Roll the
+        // optimistic advance back. (Checked before `proposal` so a reject is
+        // never misread — the two are always distinct, since we only route when
+        // the proposal differs from the reject target.)
+        state.committed = pending.rejectTarget;
+        state.pending = null;
+        return;
+      }
+      if (content === pending.proposal) {
+        // Proposal on disk: the routing write, an accept, or a re-affirmation.
+        // Keep the optimistic committed=proposal and leave `pending` in place so
+        // a later reject can still roll it back (an accept produces no further
+        // event, so `pending` simply lingers harmlessly until the next genuine
+        // change replaces it).
+        state.committed = pending.proposal;
+        pending.settled = true;
+        return;
+      }
+      if (!pending.settled) {
+        // First post-routing content that is neither what we routed nor the
+        // reject target: Zed transformed the proposal on save (format-on-save).
+        // Adopt the persisted content as the proposal — Zed's review already
+        // shows it, and `rejectTarget` stays fixed so a reject still restores
+        // correctly — instead of re-proposing it (which would double-propose and,
+        // for a non-idempotent formatter, loop).
+        pending.proposal = content;
+        pending.settled = true;
+        state.committed = content;
+        return;
+      }
+      // Settled: this is a genuine new change layered over the outstanding
+      // proposal — fall through and route it, replacing `pending`.
+    }
+
+    // The built-in Edit/Write interceptor owns this path for the duration of its
+    // mutation; its own revert/route is authoritative, so don't route here.
+    if (state.explicitMutation) return;
+
+    // No-op / transient revert echo (disk already matches the reject baseline).
+    if (content === state.committed) return;
+
+    const proposed = content;
+    const rejectTarget = state.committed;
+
+    // Revert so Zed diffs `rejectTarget → proposed` and, on reject, restores
+    // `rejectTarget` to disk.
+    try {
+      writeDisk(resolvedPath, rejectTarget);
+    } catch (e) {
+      logger.error(`[FileEditInterceptor] Failed to revert watched change ${resolvedPath}: ${e}`);
+      return;
+    }
+
+    try {
+      await writeTextFile(resolvedPath, proposed);
+    } catch (e) {
+      logger.error(
+        `[FileEditInterceptor] ACP writeTextFile failed for watched ${resolvedPath}: ${e}`,
+      );
+      // No review was created — restore the agent-written content so the change
+      // isn't lost, and treat it as the new committed baseline.
+      try {
+        writeDisk(resolvedPath, proposed);
+        state.committed = proposed;
+        state.pending = null;
+      } catch {
+        /* double failure */
+      }
+      return;
+    }
+
+    // Zed has persisted `proposed` to disk (possibly reformatted). Optimistically
+    // treat it as accepted; the first post-routing observation folds in any
+    // format-on-save transform, and a later reject restores `rejectTarget`.
+    state.pending = { proposal: proposed, rejectTarget, settled: false };
+    state.committed = proposed;
+    fileContentCache.set(resolvedPath, proposed);
+  };
+
+  // After the built-in Edit/Write interceptor has reverted disk to `revertedTo`
+  // and routed `proposed` through Zed (which persists `proposed` to disk), mirror
+  // that into the watcher state so the watcher recognizes Zed's own routing write
+  // (accept) and a later reject-restore of `revertedTo` instead of re-proposing
+  // them. Mirrors the watcher's own post-route bookkeeping.
+  const syncAfterIntercept = (
+    resolvedPath: string,
+    revertedTo: string | null,
+    proposed: string,
+  ): void => {
+    if (!watchActive || !trackedFiles.has(resolvedPath)) return;
+    const state = getPathState(resolvedPath);
+    if (revertedTo !== null) {
+      state.committed = proposed;
+      state.pending = { proposal: proposed, rejectTarget: revertedTo, settled: false };
+    } else {
+      // Uncached overwrite: no known pre-edit content to reject back to.
+      state.committed = proposed;
+      state.pending = null;
+    }
   };
 
   return {
@@ -1318,68 +1677,143 @@ export function createFileEditInterceptor(logger: Logger, cwd?: string): FileEdi
       }
     },
 
+    markExplicitMutation(filePath: string): void {
+      const resolvedPath = normalizePath(filePath);
+      getPathState(resolvedPath).explicitMutation = true;
+    },
+
+    clearExplicitMutation(filePath: string): void {
+      const resolvedPath = normalizePath(filePath);
+      const state = pathStates.get(resolvedPath);
+      if (state) state.explicitMutation = false;
+    },
+
+    isWatchActive(): boolean {
+      return watchActive;
+    },
+
+    async initializeTrackedFileWatch(): Promise<boolean> {
+      return snapshotTrackedBaselines();
+    },
+
+    async reinitializeForCwd(newCwd: string): Promise<boolean> {
+      resolvedCwd = path.resolve(newCwd);
+      return snapshotTrackedBaselines();
+    },
+
+    async onFileChanged(event, filePath, writeTextFile): Promise<void> {
+      if (event === "unlink") return;
+      if (!watchActive) return;
+      const resolvedPath = normalizePath(filePath);
+      if (!trackedFiles.has(resolvedPath)) return;
+      if (!isInScope(resolvedPath)) return;
+
+      const state = getPathState(resolvedPath);
+      state.debounceGeneration += 1;
+      const gen = state.debounceGeneration;
+
+      return new Promise<void>((resolve, reject) => {
+        state.waiters.push(resolve);
+        if (state.debounceTimer) clearTimeout(state.debounceTimer);
+        state.debounceTimer = setTimeout(() => {
+          const waiters = state.waiters.splice(0, state.waiters.length);
+          state.queue = state.queue
+            .then(async () => {
+              if (gen !== state.debounceGeneration) return;
+              await processSettledChange(resolvedPath, writeTextFile);
+            })
+            .then(
+              () => {
+                for (const w of waiters) w();
+              },
+              (err) => {
+                for (const w of waiters) w();
+                reject(err);
+              },
+            );
+        }, TRACKED_FILE_DEBOUNCE_MS);
+      });
+    },
+
     async interceptEditWrite(toolName, toolInput, toolResponse, writeTextFile) {
       const input = toolInput as { file_path?: string; [key: string]: unknown };
       const filePath = input?.file_path;
       if (!filePath) return;
-      if (isToolError(toolResponse)) return;
 
-      if (!isInScope(filePath)) return;
+      const resolvedPath = normalizePath(filePath);
+      try {
+        if (isToolError(toolResponse)) return;
+        if (!isInScope(filePath)) return;
 
-      const wasNonExistent = nonExistentFiles.has(filePath);
-      const originalContent = fileContentCache.get(filePath);
+        const wasNonExistent = nonExistentFiles.has(filePath);
+        const originalContent = fileContentCache.get(filePath);
 
-      // --- Determine new content ---
-      let newContent: string;
-      if (toolName === "Write") {
-        newContent = (toolInput as FileWriteInput).content;
-      } else if (toolName === "Edit") {
-        // Read from disk — the built-in Edit tool already wrote the new content.
-        // If the file was modified externally since the last Read, the built-in
-        // Edit will have already failed (old_string not found) and isToolError()
-        // bails out above.
-        try {
-          newContent = fs.readFileSync(filePath, "utf8");
-        } catch {
+        // --- Determine new content ---
+        let newContent: string;
+        if (toolName === "Write") {
+          newContent = (toolInput as FileWriteInput).content;
+        } else if (toolName === "Edit") {
+          // Read from disk — the built-in Edit tool already wrote the new content.
+          // If the file was modified externally since the last Read, the built-in
+          // Edit will have already failed (old_string not found) and isToolError()
+          // bails out above.
+          try {
+            newContent = fs.readFileSync(filePath, "utf8");
+          } catch {
+            return;
+          }
+        } else {
           return;
         }
-      } else {
-        return;
-      }
 
-      // --- Revert file to pre-edit state ---
-      try {
-        if (wasNonExistent) {
-          // Write created a new file — delete it so Zed's Review UI shows
-          // file creation pending accept/reject.
-          fs.unlinkSync(filePath);
-        } else if (originalContent !== undefined) {
-          fs.writeFileSync(filePath, originalContent);
-        } else {
-          // Uncached existing file — skip revert since we don't have the original
-        }
-      } catch (e) {
-        logger.error(`[FileEditInterceptor] Failed to revert ${filePath}: ${e}`);
-        return;
-      }
-
-      // --- Route through ACP → Zed Review UI ---
-      try {
-        await writeTextFile(filePath, newContent);
-      } catch (e) {
-        logger.error(`[FileEditInterceptor] ACP writeTextFile failed for ${filePath}: ${e}`);
-        // Restore the new content to disk so the edit isn't lost
+        // --- Revert file to pre-edit state ---
+        let revertedTo: string | null = null;
         try {
-          fs.writeFileSync(filePath, newContent);
-        } catch {
-          /* double failure */
+          if (wasNonExistent) {
+            // Write created a new file — delete it so Zed's Review UI shows
+            // file creation pending accept/reject.
+            fs.unlinkSync(filePath);
+          } else if (originalContent !== undefined) {
+            fs.writeFileSync(filePath, originalContent);
+            revertedTo = originalContent;
+          } else {
+            // Uncached existing file — skip revert since we don't have the original
+          }
+        } catch (e) {
+          logger.error(`[FileEditInterceptor] Failed to revert ${filePath}: ${e}`);
+          return;
         }
-        return;
-      }
 
-      // --- Update cache for consecutive edits ---
-      fileContentCache.set(filePath, newContent);
-      nonExistentFiles.delete(filePath);
+        // --- Route through ACP → Zed Review UI ---
+        try {
+          await writeTextFile(filePath, newContent);
+        } catch (e) {
+          logger.error(`[FileEditInterceptor] ACP writeTextFile failed for ${filePath}: ${e}`);
+          // Restore the new content to disk so the edit isn't lost
+          try {
+            fs.writeFileSync(filePath, newContent);
+            if (watchActive && trackedFiles.has(resolvedPath)) {
+              const state = getPathState(resolvedPath);
+              state.committed = newContent;
+              state.pending = null;
+            }
+          } catch {
+            /* double failure */
+          }
+          return;
+        }
+
+        // --- Update cache for consecutive edits ---
+        fileContentCache.set(filePath, newContent);
+        nonExistentFiles.delete(filePath);
+
+        if (!wasNonExistent) {
+          syncAfterIntercept(resolvedPath, revertedTo, newContent);
+        }
+      } finally {
+        const state = pathStates.get(resolvedPath);
+        if (state) state.explicitMutation = false;
+      }
     },
   };
 }

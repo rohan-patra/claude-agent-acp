@@ -104,9 +104,13 @@ import {
   applyTaskUpdate,
   buildMergedPlanEntries,
   ClaudePlanEntry,
+  createCwdChangedWatchHook,
+  createFileChangedHook,
   createFileEditInterceptor,
+  createPostToolUseFailureHook,
   createPostToolUseHook,
   createPreToolUseHook,
+  createSessionStartWatchHook,
   createTaskHook,
   type FileEditInterceptor,
   parseTaskCreateOutput,
@@ -5154,7 +5158,9 @@ export class ClaudeAcpAgent {
     let fileEditInterceptor: FileEditInterceptor | undefined;
     if (this.clientCapabilities?.fs?.writeTextFile) {
       fileEditInterceptor = createFileEditInterceptor(this.logger, params.cwd);
+      await fileEditInterceptor.initializeTrackedFileWatch();
     }
+    const trackedFileInterceptor = fileEditInterceptor;
 
     if (Array.isArray(params.mcpServers)) {
       for (const server of params.mcpServers) {
@@ -5346,6 +5352,9 @@ export class ClaudeAcpAgent {
                 onPreWrite: fileEditInterceptor
                   ? (filePath: string) => fileEditInterceptor.onPreWrite(filePath)
                   : undefined,
+                onExplicitMutation: fileEditInterceptor
+                  ? (filePath: string) => fileEditInterceptor.markExplicitMutation(filePath)
+                  : undefined,
               }),
             ],
           },
@@ -5373,6 +5382,64 @@ export class ClaudeAcpAgent {
             ],
           },
         ],
+        ...(trackedFileInterceptor
+          ? {
+              PostToolUseFailure: [
+                ...(userProvidedOptions?.hooks?.PostToolUseFailure || []),
+                {
+                  hooks: [
+                    createPostToolUseFailureHook({
+                      onEditWriteFailure: (filePath: string) =>
+                        trackedFileInterceptor.clearExplicitMutation(filePath),
+                    }),
+                  ],
+                },
+              ],
+              SessionStart: [
+                ...(userProvidedOptions?.hooks?.SessionStart || []),
+                {
+                  hooks: [
+                    createSessionStartWatchHook(() =>
+                      trackedFileInterceptor.isWatchActive() ? [params.cwd] : undefined,
+                    ),
+                  ],
+                },
+              ],
+              CwdChanged: [
+                ...(userProvidedOptions?.hooks?.CwdChanged || []),
+                {
+                  hooks: [
+                    createCwdChangedWatchHook(async (newCwd: string) => {
+                      const active = await trackedFileInterceptor.reinitializeForCwd(newCwd);
+                      return active ? [newCwd] : undefined;
+                    }),
+                  ],
+                },
+              ],
+              FileChanged: [
+                ...(userProvidedOptions?.hooks?.FileChanged || []),
+                {
+                  hooks: [
+                    createFileChangedHook((event, filePath) => {
+                      void trackedFileInterceptor
+                        .onFileChanged(event, filePath, async (p, content) => {
+                          await this.client.writeTextFile({
+                            sessionId,
+                            path: p,
+                            content,
+                          });
+                        })
+                        .catch((err) => {
+                          this.logger.error(
+                            `[FileEditInterceptor] FileChanged handler failed for ${filePath}: ${err}`,
+                          );
+                        });
+                    }),
+                  ],
+                },
+              ],
+            }
+          : {}),
         TaskCreated: [
           ...(userProvidedOptions?.hooks?.TaskCreated || []),
           {
@@ -6381,7 +6448,8 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   {
     value: "gpt-5.6-sol",
     displayName: "GPT-5.6 Sol",
-    description: "Flagship OpenAI model for complex, long-horizon agentic workflows and deep reasoning",
+    description:
+      "Flagship OpenAI model for complex, long-horizon agentic workflows and deep reasoning",
     family: "custom",
     capabilities: {
       supportsEffort: true,
@@ -6437,7 +6505,8 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   {
     value: "grok-4.5",
     displayName: "Grok 4.5",
-    description: "xAI frontier reasoning model optimized for software engineering and agentic workflows",
+    description:
+      "xAI frontier reasoning model optimized for software engineering and agentic workflows",
     family: "custom",
     capabilities: {
       supportsEffort: true,
@@ -6447,21 +6516,24 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   {
     value: "composer-2.5",
     displayName: "Composer 2.5",
-    description: "Cursor's in-house agentic coding model for multi-file planning, editing, and debugging",
+    description:
+      "Cursor's in-house agentic coding model for multi-file planning, editing, and debugging",
     family: "custom",
     capabilities: {},
   },
   {
     value: "auto",
     displayName: "Cursor Auto",
-    description: "Cursor's model-routing option — picks the most cost-effective and reliable model per task",
+    description:
+      "Cursor's model-routing option — picks the most cost-effective and reliable model per task",
     family: "custom",
     capabilities: {},
   },
   {
     value: "gemini-3.1-pro",
     displayName: "Gemini 3.1 Pro",
-    description: "Balanced mid-tier Google multimodal model with a 1M-token context window for deep reasoning",
+    description:
+      "Balanced mid-tier Google multimodal model with a 1M-token context window for deep reasoning",
     family: "custom",
     capabilities: {
       supportsEffort: true,
@@ -6471,7 +6543,8 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   {
     value: "gemini-3.5-flash",
     displayName: "Gemini 3.5 Flash",
-    description: "Lightweight, high-speed Google multimodal model for fast-turnaround, high-throughput tasks",
+    description:
+      "Lightweight, high-speed Google multimodal model for fast-turnaround, high-throughput tasks",
     family: "custom",
     capabilities: {
       supportsEffort: true,
@@ -6501,7 +6574,8 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   {
     value: "gpt-5.5",
     displayName: "GPT-5.5",
-    description: "OpenAI frontier model with agentic coding, multi-step reasoning, and a 1M+ token context window",
+    description:
+      "OpenAI frontier model with agentic coding, multi-step reasoning, and a 1M+ token context window",
     family: "custom",
     capabilities: {
       supportsEffort: true,

@@ -801,3 +801,123 @@ describe("createSession options merging", () => {
     });
   });
 });
+
+describe("createSession tracked-file watcher hooks", () => {
+  let agent: ClaudeAcpAgentType;
+  let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
+
+  function createMockClient(): AcpClient {
+    return {
+      sessionUpdate: async (_notification: SessionNotification) => {},
+      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      readTextFile: async () => ({ content: "" }),
+      writeTextFile: async () => ({}),
+    } as unknown as AcpClient;
+  }
+
+  beforeEach(async () => {
+    capturedOptions = undefined;
+    contextUsageResult = undefined;
+    vi.resetModules();
+    const acpAgent = await import("../acp-agent.js");
+    ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
+    agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  it("registers watcher hooks that return watchPaths when fs.writeTextFile is available in a git cwd", async () => {
+    agent.clientCapabilities = { fs: { writeTextFile: true, readTextFile: true } };
+
+    const userSessionStart = { hooks: [{ command: "echo user-session-start" }] };
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            hooks: {
+              SessionStart: [userSessionStart],
+              FileChanged: [{ hooks: [{ command: "echo user-file" }] }],
+            },
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.hooks?.SessionStart).toHaveLength(2);
+    expect(capturedOptions!.hooks?.SessionStart?.[0]).toEqual(userSessionStart);
+    expect(capturedOptions!.hooks?.FileChanged).toHaveLength(2);
+    expect(capturedOptions!.hooks?.CwdChanged).toHaveLength(1);
+    expect(capturedOptions!.hooks?.PostToolUseFailure).toHaveLength(1);
+
+    const sessionHook = capturedOptions!.hooks!.SessionStart![1].hooks[0] as any;
+    const out = await sessionHook(
+      {
+        hook_event_name: "SessionStart",
+        source: "startup",
+        session_id: "s",
+        transcript_path: "/tmp",
+        cwd: process.cwd(),
+      },
+      undefined,
+      { signal: AbortSignal.abort() },
+    );
+    expect(out.hookSpecificOutput.watchPaths).toEqual([process.cwd()]);
+
+    const fileHook = capturedOptions!.hooks!.FileChanged![1].hooks[0] as any;
+    const unlinkOut = await fileHook(
+      {
+        hook_event_name: "FileChanged",
+        event: "unlink",
+        file_path: path.join(process.cwd(), "README.md"),
+        session_id: "s",
+        transcript_path: "/tmp",
+        cwd: process.cwd(),
+      },
+      undefined,
+      { signal: AbortSignal.abort() },
+    );
+    expect(unlinkOut.continue).toBe(true);
+  });
+
+  it("does not register watcher hooks when fs.writeTextFile capability is absent", async () => {
+    agent.clientCapabilities = {};
+
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.hooks?.SessionStart).toBeUndefined();
+    expect(capturedOptions!.hooks?.FileChanged).toBeUndefined();
+    expect(capturedOptions!.hooks?.CwdChanged).toBeUndefined();
+    expect(capturedOptions!.hooks?.PostToolUseFailure).toBeUndefined();
+  });
+
+  it("registers hooks but SessionStart omits watchPaths when cwd is not a git worktree", async () => {
+    agent.clientCapabilities = { fs: { writeTextFile: true, readTextFile: true } };
+    const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-session-nongit-"));
+    try {
+      await agent.newSession({
+        cwd: nonGit,
+        mcpServers: [],
+      });
+
+      expect(capturedOptions!.hooks?.SessionStart).toHaveLength(1);
+      const sessionHook = capturedOptions!.hooks!.SessionStart![0].hooks[0] as any;
+      const out = await sessionHook(
+        {
+          hook_event_name: "SessionStart",
+          source: "startup",
+          session_id: "s",
+          transcript_path: "/tmp",
+          cwd: nonGit,
+        },
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+      expect(out.hookSpecificOutput.watchPaths).toBeUndefined();
+    } finally {
+      fs.rmSync(nonGit, { recursive: true, force: true });
+    }
+  });
+});

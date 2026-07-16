@@ -10834,4 +10834,3 @@ describe("background-task visibility (Feature A/B)", () => {
     expect(suppressBackgroundToolResults(notifications, new Map())).toBe(notifications);
   });
 });
-

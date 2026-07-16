@@ -17,7 +17,11 @@ Zed ◄──ACP──► ClaudeAcpAgent ◄──Claude Agent SDK──► Clau
                     │   ├── Edit: revert + route through ACP → Review UI
                     │   └── Write: revert + route through ACP → Review UI
                     │
-                    └── PostToolUse onFileRead (caches content for revert)
+                    ├── PostToolUse onFileRead (caches content for revert)
+                    │
+                    └── FileChanged watcher (source-agnostic fallback)
+                        └── net change to a session-start-tracked text file →
+                            revert to baseline + route through ACP → Review UI
 ```
 
 1. Claude calls the **built-in Edit or Write** tool — it executes normally, writing to disk
@@ -27,6 +31,8 @@ Zed ◄──ACP──► ClaudeAcpAgent ◄──Claude Agent SDK──► Clau
 5. The user **accepts or rejects** the change inline
 
 This works for both main sessions and subagents — since Claude uses its built-in tools directly, there are no MCP tool access issues.
+
+Changes that _don't_ go through the built-in Edit/Write tools — a Bash command, a formatter, an MCP tool, or a background process writing to disk — are caught by a second, **source-agnostic** path: the SDK's `FileChanged` filesystem watcher. When a file that was **Git-tracked and present at session start** picks up a net change, the interceptor reverts it to its session-start baseline and re-proposes the new content through the same Review Changes UI. Because a watcher event carries no tool-use ID, this path creates a native review entry only — it never fabricates or updates a tool-call card.
 
 ## Background
 
@@ -105,6 +111,17 @@ The main feature. When Claude edits or creates a file, the change appears in Zed
 - **Project-scoped** — Only files within the project directory are intercepted. Files outside the project (e.g., `~/.claude/settings.json`) are written directly by the built-in tools.
 - **`.context/` bypass** — Files inside `.context/` are written directly to disk without the review UI, since these are internal working files (plans, etc.) that shouldn't require manual approval.
 - **Safe fallback** — If ACP routing fails, the new content is restored to disk so the edit isn't lost. Uncached files (never explicitly Read) skip the revert step.
+
+#### Watcher fallback for non-tool edits
+
+Beyond the exact, tool-aware Edit/Write path above, a source-agnostic filesystem watcher surfaces changes made by anything else — Bash, formatters, MCP tools, subagents, or background processes — so they still land in Review Changes instead of silently hitting disk.
+
+- **Scope: tracked-at-start text files only** — On session start (when the client supports `fs/write_text_file` and the cwd is inside a Git worktree), the interceptor snapshots the **current working-tree contents** of every Git-tracked file as its reject baseline. Pre-existing staged/unstaged edits are preserved as that baseline — it's the working tree, not `HEAD` or the index.
+- **Net change → one proposal** — When a tracked file settles on content that differs from its baseline, the watcher reverts to the baseline and routes the new content through ACP exactly once. Rapid successive writes (e.g. a formatter rewriting a file repeatedly) are debounced to the single stable net result.
+- **Deliberate boundaries** — Deletions are ignored (an `unlink` is never restored or routed). Binaries, symlinks, unreadable files, `.context/`, files outside the cwd, and files that were untracked or created after session start are all skipped — new/untracked files remain supported only through the built-in `Write` tool. The watcher path has no tool attribution, so it never draws a tool-call card.
+- **Accept/reject is inferred from disk, matched to Zed's behavior** — Zed persists the proposed content to disk the moment it's routed (its `write_text_file` ends in a buffer save) and, on reject, restores the pre-proposal content to disk; an accept writes nothing further. ACP exposes no accept/reject callback, so the watcher infers the outcome from _which_ of the two the disk settles on: seeing the proposal means accept (the reject baseline advances to it optimistically), seeing the reject target means reject (the baseline rolls back). It never mistakes Zed's own routing write for a fresh change, and it coordinates with the built-in Edit/Write path so a single edit — accepted or rejected — never yields a second, reversed proposal.
+- **Format-on-save is handled** — if Zed reformats a file on save (`format_on_save`), the content it persists differs from what was routed. The watcher adopts that reformatted content as the same proposal rather than re-proposing it, so a formatter can't produce a double proposal (or, if non-idempotent, an unbounded loop), and reject still restores the original. Residual gaps are narrow: if a brand-new change lands on the same file in the sub-second window before a reject is observed the reject may be missed; a manual edit whose content exactly equals a pending reject target reads as a reject; and a file simultaneously open and edited in Zed's own editor can desync the reject baseline.
+- **Single-session assumption** — The filesystem protocol can't disambiguate independent sessions or adapter processes watching the same checkout, so this assumes one active ACP session per working tree.
 
 ### Background-Task Visibility
 
