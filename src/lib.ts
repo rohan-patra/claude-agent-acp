@@ -20,6 +20,7 @@ export {
   type FileEditInterceptor,
   runningTaskLabel,
   runningTaskPlanEntries,
+  mergeRunningTaskPlanEntries,
   buildMergedPlanEntries,
   suppressBackgroundToolResults,
   type RunningTask,

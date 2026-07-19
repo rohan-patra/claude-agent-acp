@@ -1453,6 +1453,8 @@ export type RunningTask = {
   type: string;
   /** agent_type for subagent tasks (used in the plan label). */
   subagentType?: string;
+  /** meta.name for workflow tasks (used in the plan label). */
+  workflowName?: string;
   description: string;
   /** Ambient/housekeeping task — hidden from the plan (SDK `skip_transcript`). */
   skipTranscript: boolean;
@@ -1464,11 +1466,23 @@ export type RunningTask = {
   backgrounded: boolean;
 };
 
-/** Human-readable plan-row label for a running task. */
+/** Human-readable plan-row label for a running task. The `type` values mirror
+ *  the SDK's friendly task-type labels ('subagent' | 'shell' | 'monitor' |
+ *  'workflow' | 'local_workflow'), falling back to the raw discriminant. */
 export function runningTaskLabel(task: RunningTask): string {
-  if (task.type === "subagent") return `subagent: ${task.subagentType ?? task.description}`;
-  if (task.type === "shell") return `shell: ${task.description}`;
-  return task.description || task.type;
+  switch (task.type) {
+    case "subagent":
+      return `subagent: ${task.subagentType || task.description || "task"}`;
+    case "shell":
+      return `shell: ${task.description || "command"}`;
+    case "monitor":
+      return `monitor: ${task.description || "task"}`;
+    case "workflow":
+    case "local_workflow":
+      return `workflow: ${task.workflowName || task.description || "workflow"}`;
+    default:
+      return task.description || task.type;
+  }
 }
 
 /** Plan entries for the backgrounded, non-ambient running tasks only. */
@@ -1484,16 +1498,30 @@ export function runningTaskPlanEntries(
 }
 
 /**
- * Sole producer of ACP plan entries: real todos (`taskState`) unioned with one
- * `in_progress` row per backgrounded running task. A settled task drops out the
- * instant it leaves `runningTasks`. Route every `sessionUpdate: "plan"` emit
- * through this so a todos-only emit can't clobber the running-task rows.
+ * Union a base plan (the todos — from either `taskState` via Task* tools or a
+ * TodoWrite snapshot) with one `in_progress` row per backgrounded running task.
+ * The single place base todos and running-task rows are combined, so no
+ * plan-emit path (Task*, TodoWrite, or a bare `runningTasks` mutation) can drop
+ * the running-task half. Route every `sessionUpdate: "plan"` emit through this
+ * or `buildMergedPlanEntries` (which delegates here).
+ */
+export function mergeRunningTaskPlanEntries(
+  base: PlanEntry[],
+  runningTasks: ReadonlyMap<string, RunningTask>,
+): PlanEntry[] {
+  return [...base, ...runningTaskPlanEntries(runningTasks)];
+}
+
+/**
+ * Sole producer of ACP plan entries for Task*-backed sessions: real todos
+ * (`taskState`) unioned with one `in_progress` row per backgrounded running
+ * task. A settled task drops out the instant it leaves `runningTasks`.
  */
 export function buildMergedPlanEntries(
   taskState: TaskState,
   runningTasks: ReadonlyMap<string, RunningTask>,
 ): PlanEntry[] {
-  return [...taskStateToPlanEntries(taskState), ...runningTaskPlanEntries(runningTasks)];
+  return mergeRunningTaskPlanEntries(taskStateToPlanEntries(taskState), runningTasks);
 }
 
 /**

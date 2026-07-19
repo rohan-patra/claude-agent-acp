@@ -117,11 +117,11 @@ import {
   createPreToolUseHook,
   createTaskHook,
   type FileEditInterceptor,
+  mergeRunningTaskPlanEntries,
   parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
   type RunningTask,
-  runningTaskPlanEntries,
   suppressBackgroundToolResults,
   TaskState,
   toolInfoFromToolUse,
@@ -1521,17 +1521,23 @@ export class ClaudeAcpAgent {
     taskId: string,
     outcome: "completed" | "failed",
     summary?: string,
+    toolUseIdHint?: string,
   ): Promise<void> {
     const task = session.runningTasks.get(taskId);
     if (!task) return;
     session.runningTasks.delete(taskId);
-    if (task.toolUseId) {
-      session.runningTaskByToolUseId.delete(task.toolUseId);
+    // Prefer the id captured at task_started; fall back to the settling
+    // message's own tool_use_id (task_notification carries one) so a card
+    // whose entry was synthesized from `background_tasks_changed` — or created
+    // by a task_started that raced its tool_result — can still be finalized.
+    const toolUseId = task.toolUseId ?? toolUseIdHint;
+    if (toolUseId) {
+      session.runningTaskByToolUseId.delete(toolUseId);
       await this.client.sessionUpdate({
         sessionId,
         update: {
           sessionUpdate: "tool_call_update",
-          toolCallId: task.toolUseId,
+          toolCallId: toolUseId,
           status: outcome,
           ...(summary
             ? { content: [{ type: "content" as const, content: { type: "text", text: summary } }] }
@@ -2748,20 +2754,28 @@ export class ClaudeAcpAgent {
                 // Upsert the RunningTask entry (merge, don't clobber — a prior
                 // `background_tasks_changed` may have already synthesized an
                 // ids-only entry for this task before this edge arrives).
-                const existing = session.runningTasks.get(message.task_id);
-                session.runningTasks.set(message.task_id, {
-                  taskId: message.task_id,
-                  toolUseId: message.tool_use_id ?? existing?.toolUseId,
-                  type: message.subagent_type
-                    ? "subagent"
-                    : (message.task_type ?? existing?.type ?? "task"),
-                  subagentType: message.subagent_type ?? existing?.subagentType,
-                  description: message.description ?? existing?.description ?? "",
-                  skipTranscript: message.skip_transcript ?? existing?.skipTranscript ?? false,
-                  backgrounded: existing?.backgrounded ?? false,
-                });
-                if (message.tool_use_id) {
-                  session.runningTaskByToolUseId.set(message.tool_use_id, message.task_id);
+                // Skipped while the session is cancelled (post-Stop, until the
+                // next turn's activateTurn resets `cancelled`): cancel() cleared
+                // the fork maps, and a buffered/raced task edge draining during
+                // or after that clear must not resurrect a plan row or re-arm a
+                // Canceled card's suppress entry.
+                if (!session.cancelled) {
+                  const existing = session.runningTasks.get(message.task_id);
+                  session.runningTasks.set(message.task_id, {
+                    taskId: message.task_id,
+                    toolUseId: message.tool_use_id ?? existing?.toolUseId,
+                    type: message.subagent_type
+                      ? "subagent"
+                      : (message.task_type ?? existing?.type ?? "task"),
+                    subagentType: message.subagent_type ?? existing?.subagentType,
+                    workflowName: message.workflow_name ?? existing?.workflowName,
+                    description: message.description ?? existing?.description ?? "",
+                    skipTranscript: message.skip_transcript ?? existing?.skipTranscript ?? false,
+                    backgrounded: existing?.backgrounded ?? false,
+                  });
+                  if (message.tool_use_id) {
+                    session.runningTaskByToolUseId.set(message.tool_use_id, message.task_id);
+                  }
                 }
                 break;
               }
@@ -2770,12 +2784,17 @@ export class ClaudeAcpAgent {
                 // from it, so its registry entry can be dropped.
                 session.liveBackgroundTasks.delete(message.task_id);
                 // Fork visibility: finalize the plan-panel/tool-card row too.
+                // task_notification carries `tool_use_id`, so pass it as the
+                // finalize hint — that lets a card be closed even when its
+                // RunningTask entry never captured a toolUseId (level-only /
+                // raced task_started).
                 await this.finalizeRunningTask(
                   session,
                   message.session_id,
                   message.task_id,
                   message.status === "completed" ? "completed" : "failed",
                   message.summary,
+                  message.tool_use_id,
                 );
                 break;
               case "task_updated":
@@ -2944,27 +2963,33 @@ export class ClaudeAcpAgent {
                 // can't wedge a stale plan row. Task removal + card
                 // finalization stay owned by the guaranteed terminal edges
                 // (task_notification / terminal task_updated), so this can only
-                // ever add/clear visibility.
-                for (const t of message.tasks) {
-                  const existingTask = session.runningTasks.get(t.task_id);
-                  if (existingTask) {
-                    existingTask.backgrounded = true;
-                    existingTask.type = t.task_type || existingTask.type;
-                    existingTask.description = existingTask.description || t.description;
-                  } else {
-                    session.runningTasks.set(t.task_id, {
-                      taskId: t.task_id,
-                      type: t.task_type,
-                      description: t.description,
-                      skipTranscript: false,
-                      backgrounded: true,
-                    });
+                // ever add/clear visibility. Skipped while the session is
+                // cancelled (post-Stop, until the next turn's activateTurn
+                // resets `cancelled`): cancel() cleared the fork maps, and a
+                // buffered level draining afterward must not resurrect a plan
+                // row for a background task the Stop dismissed.
+                if (!session.cancelled) {
+                  for (const t of message.tasks) {
+                    const existingTask = session.runningTasks.get(t.task_id);
+                    if (existingTask) {
+                      existingTask.backgrounded = true;
+                      existingTask.type = t.task_type || existingTask.type;
+                      existingTask.description = existingTask.description || t.description;
+                    } else {
+                      session.runningTasks.set(t.task_id, {
+                        taskId: t.task_id,
+                        type: t.task_type,
+                        description: t.description,
+                        skipTranscript: false,
+                        backgrounded: true,
+                      });
+                    }
                   }
+                  for (const task of session.runningTasks.values()) {
+                    if (task.backgrounded && !live.has(task.taskId)) task.backgrounded = false;
+                  }
+                  await this.emitPlan(session, message.session_id);
                 }
-                for (const task of session.runningTasks.values()) {
-                  if (task.backgrounded && !live.has(task.taskId)) task.backgrounded = false;
-                }
-                await this.emitPlan(session, message.session_id);
                 break;
               }
               default:
@@ -3815,6 +3840,21 @@ export class ClaudeAcpAgent {
     // count-lane orphan would be left for the map-lane receipt path (which
     // never decrements the count) to miss.
     const lifecycleLane = session.msgLifecycleV1 === true;
+    // Fork visibility: a Stop tears the turn down and Zed marks every
+    // outstanding `in_progress` card Canceled, but the SDK's background tasks
+    // can outlive the turn. Clear our running-task bookkeeping now — a
+    // synchronous mutation, so it stays ahead of the awaited interrupt() below
+    // (during which the consumer may drain a buffered terminal task edge)
+    // without perturbing the queued-turn settle that must precede the first
+    // await. Held cards stop being rewritten to `in_progress`; a late terminal
+    // edge then no-ops (its entry is gone) instead of resurrecting a Canceled
+    // card as `completed`. The matching plan re-emit (dropping the running rows)
+    // is deferred to just before interrupt(), where an await is already safe.
+    const hadRunningTasks = session.runningTasks.size > 0;
+    if (hadRunningTasks) {
+      session.runningTasks.clear();
+      session.runningTaskByToolUseId.clear();
+    }
     // Settle queued turns that haven't started yet (no echo seen) right away —
     // they have no in-flight SDK work to interrupt. The active turn is settled
     // by the consumer when it observes the interrupt's trailing idle (or via the
@@ -3965,6 +4005,22 @@ export class ClaudeAcpAgent {
         );
         cancelController.abort();
       }, this.forceCancelGraceMs);
+    }
+
+    // Fork visibility: re-emit the plan without the running-task rows we cleared
+    // above. Deferred to here — past all the synchronous turn-settle logic and
+    // the backstop arming — so its await can't reorder that sensitive
+    // pre-interrupt bookkeeping. Guarded like the btwQuery.interrupt() above: a
+    // broken client transport must not throw out of cancel() and skip the
+    // interrupt() + receipt reconciliation below.
+    if (hadRunningTasks) {
+      try {
+        await this.emitPlan(session, params.sessionId);
+      } catch (error) {
+        this.logger.error(
+          `[claude-agent-acp] Error emitting plan during cancel: ${(error as Error).message}`,
+        );
+      }
     }
 
     const receipt = await session.query.interrupt();
@@ -7429,10 +7485,12 @@ export function toAcpNotifications(
           if (Array.isArray(chunk.input?.todos)) {
             update = {
               sessionUpdate: "plan",
-              entries: [
-                ...planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
-                ...runningTaskPlanEntries(runningTasks),
-              ],
+              // Route the TodoWrite snapshot through the same combiner as the
+              // Task*/emitPlan paths so the running-task rows are never dropped.
+              entries: mergeRunningTaskPlanEntries(
+                planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
+                runningTasks,
+              ),
             };
           }
         } else if (isTaskTool(chunk.name)) {

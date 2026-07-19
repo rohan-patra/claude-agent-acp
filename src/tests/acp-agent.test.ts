@@ -8,6 +8,7 @@ import {
   methods,
   ndJsonStream,
   NewSessionResponse,
+  PlanEntry,
   PromptRequest,
   PromptResponse,
   ReadTextFileRequest,
@@ -27,6 +28,8 @@ import {
   toolUpdateFromDiffToolResponse,
   type RunningTask,
   buildMergedPlanEntries,
+  mergeRunningTaskPlanEntries,
+  runningTaskLabel,
   suppressBackgroundToolResults,
   runningTaskPlanEntries,
   type TaskState,
@@ -10832,6 +10835,279 @@ describe("background-task visibility (Feature A/B)", () => {
 
     // Identity (same array reference) when nothing can possibly match.
     expect(suppressBackgroundToolResults(notifications, new Map())).toBe(notifications);
+  });
+
+  it("finalizes the card via the task_notification's tool_use_id when the entry has no stored toolUseId (level-only / raced task_started)", async () => {
+    const { agent, updates } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        // The level synthesizes an ids-only entry (no tool_use_id) BEFORE any
+        // task_started ever arrives — so the RunningTask has no toolUseId.
+        {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [{ task_id: "task-x", task_type: "shell", description: "sleep 100" }],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        // The settling notification carries the spawning tool_use_id — the only
+        // place it's available for this task, so finalize must use it.
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "task-x",
+          tool_use_id: "toolu_shell",
+          status: "completed",
+          output_file: "",
+          summary: "",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    await agent.sessions["test-session"]?.consumer;
+
+    // The card is finalized against the notification's tool_use_id even though
+    // the synthesized entry never captured one.
+    const calls = toolCallUpdatesFor(updates, "toolu_shell");
+    expect(calls.length).toBeGreaterThan(0);
+    expect((calls[calls.length - 1].update as any).status).toBe("completed");
+    expect(agent.sessions["test-session"]!.runningTasks.size).toBe(0);
+  });
+
+  it("cancel() clears running-task bookkeeping and re-emits a plan without the running rows (Stop leaves nothing spinning)", async () => {
+    const { agent, updates } = createCapturingAgent();
+    // A session with a live backgrounded task and a held card, but no active
+    // turn / queue — cancel() should still drop the fork visibility state.
+    injectGeneratorSession(agent, makeGenerator([]), {
+      runningTasks: new Map<string, RunningTask>([
+        [
+          "task-bg",
+          {
+            taskId: "task-bg",
+            toolUseId: "toolu_bg",
+            type: "shell",
+            description: "sleep 100",
+            skipTranscript: false,
+            backgrounded: true,
+          },
+        ],
+      ]),
+      runningTaskByToolUseId: new Map([["toolu_bg", "task-bg"]]),
+    });
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const session = agent.sessions["test-session"]!;
+    expect(session.runningTasks.size).toBe(0);
+    expect(session.runningTaskByToolUseId.size).toBe(0);
+
+    // A fresh plan was emitted with no in_progress running-task row left.
+    const planUpdates = updates.filter((u) => u.update.sessionUpdate === "plan");
+    expect(planUpdates.length).toBeGreaterThan(0);
+    const lastPlan = planUpdates[planUpdates.length - 1];
+    expect((lastPlan.update as any).entries.some((e: any) => e.status === "in_progress")).toBe(
+      false,
+    );
+
+    // Suppression is now inert, so a later terminal tool_call_update passes
+    // through unchanged instead of being resurrected to in_progress.
+    const passthrough = suppressBackgroundToolResults(
+      [
+        {
+          sessionId: "test-session",
+          update: { sessionUpdate: "tool_call_update", toolCallId: "toolu_bg", status: "completed" },
+        },
+      ] as unknown as SessionNotification[],
+      session.runningTaskByToolUseId,
+    );
+    expect((passthrough[0].update as any).status).toBe("completed");
+  });
+
+  it("surfaces a running workflow in the plan with its meta name from task_started's workflow_name", async () => {
+    const { agent, updates } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        taskStarted("wf-1", "toolu_wf", {
+          task_type: "local_workflow",
+          workflow_name: "spec",
+          description: "Run the spec workflow",
+        }),
+        {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [{ task_id: "wf-1", task_type: "local_workflow", description: "Run the spec workflow" }],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    await agent.sessions["test-session"]?.consumer;
+
+    const planUpdates = updates.filter((u) => u.update.sessionUpdate === "plan");
+    expect(
+      planUpdates.some((u) =>
+        (u.update as any).entries.some(
+          (e: any) => e.content === "workflow: spec" && e.status === "in_progress",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("runningTaskLabel renders subagent / shell / monitor / workflow labels (pure)", () => {
+    const base = { description: "", skipTranscript: false, backgrounded: true } as const;
+    expect(
+      runningTaskLabel({ ...base, taskId: "1", type: "subagent", subagentType: "code-reviewer" }),
+    ).toBe("subagent: code-reviewer");
+    expect(runningTaskLabel({ ...base, taskId: "2", type: "shell", description: "npm test" })).toBe(
+      "shell: npm test",
+    );
+    expect(
+      runningTaskLabel({ ...base, taskId: "3", type: "monitor", description: "watch logs" }),
+    ).toBe("monitor: watch logs");
+    expect(
+      runningTaskLabel({ ...base, taskId: "4", type: "workflow", workflowName: "spec" }),
+    ).toBe("workflow: spec");
+    expect(
+      runningTaskLabel({ ...base, taskId: "5", type: "local_workflow", workflowName: "review" }),
+    ).toBe("workflow: review");
+    // Unknown type falls back to description, then the raw discriminant.
+    expect(runningTaskLabel({ ...base, taskId: "6", type: "mcp_task", description: "call" })).toBe(
+      "call",
+    );
+    expect(runningTaskLabel({ ...base, taskId: "7", type: "other" })).toBe("other");
+  });
+
+  it("mergeRunningTaskPlanEntries appends running rows to any base plan (single combiner used by TodoWrite + Task*)", () => {
+    const base: PlanEntry[] = [{ content: "Write docs", status: "pending", priority: "medium" }];
+    const runningTasks = new Map<string, RunningTask>([
+      [
+        "a",
+        {
+          taskId: "a",
+          type: "shell",
+          description: "sleep 100",
+          skipTranscript: false,
+          backgrounded: true,
+        },
+      ],
+    ]);
+    expect(mergeRunningTaskPlanEntries(base, runningTasks)).toEqual([
+      { content: "Write docs", status: "pending", priority: "medium" },
+      { content: "shell: sleep 100", status: "in_progress", priority: "medium" },
+    ]);
+    // Identity of the base rows is preserved (base first, running appended).
+    expect(mergeRunningTaskPlanEntries(base, new Map())).toEqual(base);
+  });
+
+  it("cancel() durably clears running tasks: buffered background_tasks_changed / task_started drained after the Stop don't resurrect the row or card", async () => {
+    const { agent, updates } = createCapturingAgent();
+    let openGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+
+    injectGeneratorSession(
+      agent,
+      (input) =>
+        (async function* () {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: userMessage } = await iter.next();
+          yield userEcho(userMessage);
+          // A live backgrounded shell task with a held card.
+          yield {
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [{ task_id: "task-x", task_type: "shell", description: "sleep 100" }],
+            uuid: randomUUID(),
+            session_id: "test-session",
+          };
+          yield taskStarted("task-x", "toolu_x", { task_type: "shell", description: "sleep 100" });
+          // Block until the test has issued the Stop, so what follows drains
+          // with session.cancelled === true (the post-Stop window).
+          await gate;
+          // Buffered adds that survive the interrupt (upstream #870 does not
+          // tear down background shells). The cancelled guards must skip them.
+          yield {
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [{ task_id: "task-x", task_type: "shell", description: "sleep 100" }],
+            uuid: randomUUID(),
+            session_id: "test-session",
+          };
+          yield taskStarted("task-x", "toolu_x", { task_type: "shell", description: "sleep 100" });
+          // A terminal edge for the cleared task must no-op (entry is gone), so
+          // it can't resurrect the Canceled card as completed.
+          yield {
+            type: "system",
+            subtype: "task_notification",
+            task_id: "task-x",
+            tool_use_id: "toolu_x",
+            status: "completed",
+            output_file: "",
+            summary: "",
+            uuid: randomUUID(),
+            session_id: "test-session",
+          };
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        })(),
+      {
+        toolUseCache: {
+          toolu_x: { type: "tool_use", id: "toolu_x", name: "Bash", input: { command: "sleep 100" } },
+        },
+      },
+    );
+
+    const session = agent.sessions["test-session"]!;
+    const promptDone = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+
+    // Wait for the live task to register before Stopping.
+    for (let i = 0; i < 200 && session.runningTasks.size === 0; i++) {
+      await new Promise((r) => setImmediate(r));
+    }
+    expect(session.runningTasks.size).toBe(1);
+
+    const boundary = updates.length;
+    await agent.cancel({ sessionId: "test-session" });
+    // The clear is immediate.
+    expect(session.runningTasks.size).toBe(0);
+    expect(session.runningTaskByToolUseId.size).toBe(0);
+
+    // Drain the buffered post-Stop events.
+    openGate();
+    await promptDone;
+    await session.consumer;
+
+    // The guards kept the cleared state clear.
+    expect(session.runningTasks.size).toBe(0);
+    expect(session.runningTaskByToolUseId.size).toBe(0);
+
+    const afterCancel = updates.slice(boundary);
+    // No running-task row re-emitted into the plan after the Stop.
+    for (const u of afterCancel) {
+      if (u.update.sessionUpdate === "plan") {
+        expect((u.update as any).entries.some((e: any) => e.status === "in_progress")).toBe(false);
+      }
+    }
+    // The held card is not resurrected to completed by the buffered notification.
+    const resurrected = afterCancel.some(
+      (u) =>
+        u.update.sessionUpdate === "tool_call_update" &&
+        (u.update as any).toolCallId === "toolu_x" &&
+        (u.update as any).status === "completed",
+    );
+    expect(resurrected).toBe(false);
   });
 });
 
