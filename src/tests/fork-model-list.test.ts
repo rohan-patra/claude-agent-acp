@@ -40,11 +40,11 @@ describe("buildForkModelList", () => {
   it("surfaces the full Claude Code picker in order, replacing the SDK's 4-model list", () => {
     const models = buildForkModelList(SDK_MODELS);
     expect(models.map((m) => [m.value, m.displayName])).toEqual([
-      ["fable", "Fable 5"],
+      ["fable[1m]", "Fable 5"],
       ["gpt-5.6-sol", "GPT-5.6 Sol"],
       ["opus[1m]", "Opus 4.8 1M"],
       ["gpt-5.6-terra", "GPT-5.6 Terra"],
-      ["sonnet", "Sonnet 5 1M"],
+      ["sonnet[1m]", "Sonnet 5 1M"],
       ["gpt-5.6-luna", "GPT-5.6 Luna"],
       ["gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"],
       ["haiku", "Haiku 4.5"],
@@ -126,7 +126,7 @@ describe("buildForkModelList", () => {
 
   it("donates Sonnet/Haiku capability flags from their SDK templates", () => {
     const models = buildForkModelList(SDK_MODELS);
-    const sonnet = models.find((m) => m.value === "sonnet")!;
+    const sonnet = models.find((m) => m.value === "sonnet[1m]")!;
     expect(sonnet.supportedEffortLevels).toEqual(["low", "medium", "high", "max"]);
     expect(sonnet.supportsFastMode).toBeUndefined();
     expect(sonnet.supportsAutoMode).toBe(true);

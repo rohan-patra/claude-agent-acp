@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
-let contextUsageResult: (() => Promise<{ rawMaxTokens: number }>) | undefined;
+let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -56,15 +56,36 @@ describe("createSession options merging", () => {
     } as unknown as AcpClient;
   }
 
+  let originalClaudeConfigDir: string | undefined;
+  let tempClaudeConfigDir: string;
+
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+
+    // Isolate from the real machine's global ~/.claude/settings.json — these
+    // tests assume no model override is configured there (e.g. a personal
+    // `model` preference would otherwise leak into `settingsManager.getSettings()`
+    // via the SDK's resolveSettings() and silently change which model/context
+    // window path each test exercises).
+    originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    tempClaudeConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-test-claude-config-"));
+    process.env.CLAUDE_CONFIG_DIR = tempClaudeConfigDir;
 
     vi.resetModules();
     const acpAgent = await import("../acp-agent.js");
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  afterEach(() => {
+    if (originalClaudeConfigDir !== undefined) {
+      process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
+    } else {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    }
+    fs.rmSync(tempClaudeConfigDir, { recursive: true, force: true });
   });
 
   it("merges user-provided disallowedTools with ACP internal list", async () => {
@@ -633,38 +654,114 @@ describe("createSession options merging", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
     }
 
-    it("seeds contextWindowSize from the SDK's getContextUsage report", async () => {
-      // Aliases like `sonnet` can resolve to an extended-context model with no
-      // "1m" token anywhere in id/displayName/description, so the authoritative
-      // report must win over text inference (issue #596).
-      contextUsageResult = async () => ({ rawMaxTokens: 967000 });
+    it("does not call getContextUsage during session creation", async () => {
+      // getContextUsage stalls until the session's first prompt turn has run
+      // (it is not serviced pre-turn), so session/new must never call it —
+      // awaiting it inline is what regressed session/new latency in 0.59.0.
+      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      contextUsageResult = ctxSpy;
 
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000);
+      expect(ctxSpy).not.toHaveBeenCalled();
     });
 
-    it("falls back to the default window when getContextUsage fails and inference misses", async () => {
-      // getContextUsage rejects, and the mock model ("claude-sonnet-4-6" /
-      // "Claude Sonnet" / "Fast") has no "1m" hint.
-      contextUsageResult = () => Promise.reject(new Error("no context usage mocked"));
-      // The rejection is deliberate — capture the agent's warning instead of
-      // letting it hit the console.
-      const errorSpy = vi.fn();
-      (agent as any).logger = { log: () => {}, error: errorSpy };
+    it("seeds contextWindowSize from text inference, falling back to the default when it misses", async () => {
+      // Pin to the mock SDK's own model ("claude-sonnet-4-6" / "Claude Sonnet" /
+      // "Fast"), which carries no "1m" token anywhere, so inference misses and the
+      // window falls back to the default; the authoritative value arrives later via
+      // result.modelUsage. Without this pin, `currentModel` would default to the
+      // fork's own model picker's first entry (`fable[1m]`), which legitimately
+      // contains "1m" and would make text inference hit instead of miss.
+      const originalAnthropicModel = process.env.ANTHROPIC_MODEL;
+      process.env.ANTHROPIC_MODEL = "claude-sonnet-4-6";
+      try {
+        contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
-      expect(errorSpy).toHaveBeenCalled();
+        expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+        expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
+      } finally {
+        if (originalAnthropicModel !== undefined) {
+          process.env.ANTHROPIC_MODEL = originalAnthropicModel;
+        } else {
+          delete process.env.ANTHROPIC_MODEL;
+        }
+      }
     });
 
-    it("ignores a nonsensical (non-positive) reported window", async () => {
-      contextUsageResult = async () => ({ rawMaxTokens: 0 });
+    it("session/load seeds the window from the resumed session's getContextUsage report", async () => {
+      // Resumed sessions get getContextUsage serviced pre-turn (issue #845 uses
+      // it to restore the live model), and the same response carries the
+      // authoritative window (`rawMaxTokens`). After a process restart the
+      // module cache is empty and text inference misses natively-1M aliases, so
+      // discarding this in-hand value would replay the issue-#596 flicker on
+      // every reload — the flagship scenario. 888_000 can only come from the
+      // report: inference on the mock model yields null → 200_000 default.
+      contextUsageResult = async () => ({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
 
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await (
+        agent as unknown as {
+          createSession: (params: object, opts: { resume?: string }) => Promise<unknown>;
+        }
+      ).createSession({ cwd: process.cwd(), mcpServers: [] }, { resume: "resumed-window-probe" });
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      const session = sessionFor("resumed-window-probe");
+      expect(session.contextWindowSize).toBe(888_000);
+      expect(session.contextWindowAuthoritative).toBe(true);
+    });
+
+    it("scopes providerCacheKey by per-session env routing", async () => {
+      // The context-window cache key must distinguish backends exactly as the
+      // CLI will see them: a session routed to a proxy via _meta env shares a
+      // model id spelling with default-routed sessions but not a context lane,
+      // so it must land in its own cache bucket (and two default-routed
+      // sessions must share one).
+      const r1 = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const r2 = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: { env: { ANTHROPIC_BASE_URL: "https://window-probe-proxy.example" } },
+          },
+        },
+      });
+      const r3 = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(sessionFor(r2.sessionId).providerCacheKey).not.toBe(
+        sessionFor(r1.sessionId).providerCacheKey,
+      );
+      expect(sessionFor(r3.sessionId).providerCacheKey).toBe(
+        sessionFor(r1.sessionId).providerCacheKey,
+      );
+    });
+
+    it("scopes providerCacheKey by provider headers: same endpoint, different headers → different buckets", async () => {
+      // Two providers/set configs sharing apiType+baseUrl but differing in
+      // headers (e.g. an `anthropic-beta: context-1m-…` routing header) can
+      // serve different context lanes for the same model id, so they must not
+      // share a window-cache bucket.
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      const plain = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: { "anthropic-beta": "context-1m-2025-08-07" },
+      });
+      const beta = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(sessionFor(beta.sessionId).providerCacheKey).not.toBe(
+        sessionFor(plain.sessionId).providerCacheKey,
+      );
     });
   });
 

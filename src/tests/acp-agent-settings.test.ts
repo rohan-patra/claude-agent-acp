@@ -225,7 +225,9 @@ describe("ClaudeAcpAgent settings", () => {
     // No setModel call is needed because no override was applied — the SDK is
     // already on its own default flagship.
     expect(setModelSpy).not.toHaveBeenCalled();
-    expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe("fable");
+    expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+      "fable[1m]",
+    );
   });
 
   describe("auto mode availability per model", () => {
@@ -590,11 +592,11 @@ describe("ClaudeAcpAgent settings", () => {
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
       expect(modelOption.options.map((o: any) => o.value)).toEqual([
-        "fable",
+        "fable[1m]",
         "gpt-5.6-sol",
         "opus[1m]",
         "gpt-5.6-terra",
-        "sonnet",
+        "sonnet[1m]",
         "gpt-5.6-luna",
         "gpt-5.3-codex-spark",
         "haiku",
