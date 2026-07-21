@@ -6862,15 +6862,29 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
       supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
     },
   },
+  // Gemini 3.6 Flash ships as fixed-effort variants — the effort level is
+  // baked into the model id, so no effort dropdown is advertised (unlike
+  // `gemini-3.1-pro`, where effort is a separate selector).
   {
-    value: "gemini-3.5-flash",
-    displayName: "Gemini 3.5 Flash",
-    description: "Lightweight, high-speed Google multimodal model for fast-turnaround, high-throughput tasks",
+    value: "gemini-3.6-flash-low",
+    displayName: "Gemini 3.6 Flash Low",
+    description: "Lightweight, high-speed Google multimodal model at low effort for maximum throughput",
     family: "custom",
-    capabilities: {
-      supportsEffort: true,
-      supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-    },
+    capabilities: {},
+  },
+  {
+    value: "gemini-3.6-flash-medium",
+    displayName: "Gemini 3.6 Flash Medium",
+    description: "Lightweight, high-speed Google multimodal model at medium effort for everyday fast-turnaround tasks",
+    family: "custom",
+    capabilities: {},
+  },
+  {
+    value: "gemini-3.6-flash-high",
+    displayName: "Gemini 3.6 Flash High",
+    description: "Lightweight, high-speed Google multimodal model at high effort for harder high-throughput tasks",
+    family: "custom",
+    capabilities: {},
   },
   // Older same-family variants, kept selectable but ranked below their
   // newer sibling and the rest of the picker.

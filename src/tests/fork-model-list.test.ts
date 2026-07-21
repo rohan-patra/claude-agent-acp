@@ -52,7 +52,9 @@ describe("buildForkModelList", () => {
       ["composer-2.5", "Composer 2.5"],
       ["auto", "Cursor Auto"],
       ["gemini-3.1-pro", "Gemini 3.1 Pro"],
-      ["gemini-3.5-flash", "Gemini 3.5 Flash"],
+      ["gemini-3.6-flash-low", "Gemini 3.6 Flash Low"],
+      ["gemini-3.6-flash-medium", "Gemini 3.6 Flash Medium"],
+      ["gemini-3.6-flash-high", "Gemini 3.6 Flash High"],
       ["claude-opus-4-7[1m]", "Opus 4.7 1M"],
       ["claude-opus-4-6[1m]", "Opus 4.6 1M"],
       ["claude-sonnet-4-6", "Sonnet 4.6"],
@@ -80,6 +82,18 @@ describe("buildForkModelList", () => {
     const gemini = models.find((m) => m.value === "gemini-3.1-pro")!;
     expect(gemini.supportedEffortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
 
+    // Gemini 3.6 Flash variants bake the effort level into the model id, so
+    // they advertise no effort selector.
+    for (const value of [
+      "gemini-3.6-flash-low",
+      "gemini-3.6-flash-medium",
+      "gemini-3.6-flash-high",
+    ]) {
+      const flash = models.find((m) => m.value === value)!;
+      expect(flash.supportsEffort, value).toBeUndefined();
+      expect(flash.supportedEffortLevels, value).toBeUndefined();
+    }
+
     const auto = models.find((m) => m.value === "auto")!;
     expect(auto.supportsEffort).toBeUndefined();
     expect(auto.supportedEffortLevels).toBeUndefined();
@@ -99,7 +113,9 @@ describe("buildForkModelList", () => {
       "composer-2.5",
       "auto",
       "gemini-3.1-pro",
-      "gemini-3.5-flash",
+      "gemini-3.6-flash-low",
+      "gemini-3.6-flash-medium",
+      "gemini-3.6-flash-high",
       "gpt-5.5",
       "gpt-5.4",
       "gpt-5.4-mini",
