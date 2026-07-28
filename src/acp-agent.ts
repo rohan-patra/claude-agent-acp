@@ -7118,8 +7118,8 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   { value: "fable[1m]", displayName: "Fable 5", description: "Fable 5", family: "opus" },
   {
     value: "opus[1m]",
-    displayName: "Opus 4.8 1M",
-    description: "Opus 4.8 with 1M context",
+    displayName: "Opus 5 1M",
+    description: "Opus 5 with 1M context",
     family: "opus",
   },
   {
@@ -7131,6 +7131,12 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   { value: "haiku", displayName: "Haiku 4.5", description: "Haiku 4.5", family: "haiku" },
   // Older same-family variants, kept selectable but ranked below their
   // newer sibling and the rest of the picker.
+  {
+    value: "claude-opus-4-8[1m]",
+    displayName: "Opus 4.8 1M",
+    description: "Opus 4.8 with 1M context",
+    family: "opus",
+  },
   {
     value: "claude-opus-4-7[1m]",
     displayName: "Opus 4.7 1M",

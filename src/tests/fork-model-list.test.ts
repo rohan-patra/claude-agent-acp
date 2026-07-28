@@ -41,9 +41,10 @@ describe("buildForkModelList", () => {
     const models = buildForkModelList(SDK_MODELS);
     expect(models.map((m) => [m.value, m.displayName])).toEqual([
       ["fable[1m]", "Fable 5"],
-      ["opus[1m]", "Opus 4.8 1M"],
+      ["opus[1m]", "Opus 5 1M"],
       ["sonnet[1m]", "Sonnet 5 1M"],
       ["haiku", "Haiku 4.5"],
+      ["claude-opus-4-8[1m]", "Opus 4.8 1M"],
       ["claude-opus-4-7[1m]", "Opus 4.7 1M"],
       ["claude-opus-4-6[1m]", "Opus 4.6 1M"],
       ["claude-sonnet-4-6", "Sonnet 4.6"],
@@ -59,7 +60,7 @@ describe("buildForkModelList", () => {
 
   it("donates Opus capability flags from the SDK `default` template to every Opus entry", () => {
     const models = buildForkModelList(SDK_MODELS);
-    for (const value of ["fable[1m]", "opus[1m]", "claude-opus-4-7[1m]", "claude-opus-4-6[1m]"]) {
+    for (const value of ["fable[1m]", "opus[1m]", "claude-opus-4-8[1m]", "claude-opus-4-7[1m]", "claude-opus-4-6[1m]"]) {
       const m = models.find((x) => x.value === value)!;
       expect(m.supportsEffort, value).toBe(true);
       expect(m.supportedEffortLevels, value).toEqual(["low", "medium", "high", "xhigh", "max"]);

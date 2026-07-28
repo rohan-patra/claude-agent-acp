@@ -129,9 +129,10 @@ Plan files and other context artifacts are stored in `.context/` within the proj
 The Claude Agent SDK only exposes a curated set of 4 models to ACP clients (Opus 4.8 1M as "Default", Sonnet, Sonnet 1M, Haiku) — it has no API that lists the version-pinned variants, even though the underlying CLI supports them. This fork surfaces the full Claude model picker instead:
 
 - Fable 5
-- Opus 4.8 1M
+- Opus 5 1M (rolling alias `opus[1m]`)
 - Sonnet 5 1M
 - Haiku 4.5
+- Opus 4.8 1M (pinned `claude-opus-4-8[1m]`)
 - Opus 4.7 1M
 - Opus 4.6 1M
 - Sonnet 4.6

@@ -559,6 +559,7 @@ describe("ClaudeAcpAgent settings", () => {
         "opus[1m]",
         "sonnet[1m]",
         "haiku",
+        "claude-opus-4-8[1m]",
         "claude-opus-4-7[1m]",
         "claude-opus-4-6[1m]",
         "claude-sonnet-4-6",
