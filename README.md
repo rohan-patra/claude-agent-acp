@@ -124,6 +124,20 @@ Plan files and other context artifacts are stored in `.context/` within the proj
 - **Fast mode toggle** — When the model supports it, an Off/Fast toggle appears. Server-side transitions (e.g., cooldown) are synced back to the UI.
 - **Ultracode** — When the model is xhigh-capable (e.g. Opus) and the Workflows feature is enabled, an "Ultracode" entry appears at the bottom of the effort/thought-level list. Selecting it turns on the SDK's `ultracode` mode (xhigh effort + standing dynamic-workflow orchestration); selecting any normal effort level turns it back off. It's session-scoped and never persisted.
 
+### Expanded Model Picker
+
+The Claude Agent SDK only exposes a curated set of 4 models to ACP clients (Opus 4.8 1M as "Default", Sonnet, Sonnet 1M, Haiku) — it has no API that lists the version-pinned variants, even though the underlying CLI supports them. This fork surfaces the full Claude model picker instead:
+
+- Fable 5
+- Opus 4.8 1M
+- Sonnet 5 1M
+- Haiku 4.5
+- Opus 4.7 1M
+- Opus 4.6 1M
+- Sonnet 4.6
+
+Only built-in Claude models are listed. Setting an `availableModels` allowlist in `settings.json` overrides this with your own list (unchanged from upstream). See [CLAUDE.md](./CLAUDE.md) for how the list is built and maintained.
+
 ### Patched Claude Agent SDK
 
 This fork depends on a [patched build of the Claude Agent SDK](https://github.com/rohan-patra/claude-agent-sdk-patch) rather than the official npm package (it keeps the same `@anthropic-ai/claude-agent-sdk` name, so it's a drop-in replacement).

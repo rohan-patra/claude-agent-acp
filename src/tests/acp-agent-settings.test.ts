@@ -220,13 +220,13 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    // Bad model is ignored at the usage site; with no allowlist the SDK's
-    // model list is used directly, falling back to its first entry.
+    // Bad model is ignored at the usage site; with no allowlist the picker is
+    // the fork's Claude model list, so it falls back to its first entry (Fable 5).
     // No setModel call is needed because no override was applied — the SDK is
-    // already on its own default.
+    // already on its own default flagship.
     expect(setModelSpy).not.toHaveBeenCalled();
     expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
-      "claude-sonnet-4-6",
+      "fable[1m]",
     );
   });
 
@@ -530,6 +530,39 @@ describe("ClaudeAcpAgent settings", () => {
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
       expect(modelOption.options.map((o: any) => o.value)).toEqual(["default"]);
+    });
+
+    it("surfaces the fork's full Claude model picker when availableModels is absent", async () => {
+      // With no allowlist the SDK's curated list is replaced by the fork's
+      // explicit Claude picker (see `buildForkModelList`), regardless of
+      // what the SDK surfaced.
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      expect(modelOption.options.map((o: any) => o.value)).toEqual([
+        "fable[1m]",
+        "opus[1m]",
+        "sonnet[1m]",
+        "haiku",
+        "claude-opus-4-7[1m]",
+        "claude-opus-4-6[1m]",
+        "claude-sonnet-4-6",
+      ]);
     });
 
     it("passes the user's exact ID to setModel when it matches an SDK alias", async () => {
@@ -887,12 +920,11 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    // `opus[1m]` resolves via alias matching to `claude-opus-4-6-1m` from the
-    // SDK's model list. Since the resolved value differs from the SDK's default,
-    // setModel is called with the resolved model ID.
-    expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
+    // `opus[1m]` matches the fork picker entry verbatim; since the SDK's real
+    // list never surfaced it, we sync the pin via setModel.
+    expect(setModelSpy).toHaveBeenCalledWith("opus[1m]");
     expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
-      "claude-opus-4-6-1m",
+      "opus[1m]",
     );
   });
 
@@ -1000,21 +1032,9 @@ describe("ClaudeAcpAgent settings", () => {
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
 
-      querySpy.mockImplementation(() => {
-        return makeMockQuery({
-          initializationResult: async () => ({
-            models: [
-              {
-                value: "default",
-                displayName: "Default",
-                description: "Opus",
-                supportsEffort: true,
-                supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-              },
-            ],
-          }),
-        }) as any;
-      });
+      // No allowlist → the fork picker's default is Fable 5, which is
+      // xhigh-capable; no settings disable workflows.
+      mockQuery();
 
       const { ClaudeAcpAgent } = await import("../acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
@@ -1037,21 +1057,7 @@ describe("ClaudeAcpAgent settings", () => {
       );
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
-      querySpy.mockImplementation(() => {
-        return makeMockQuery({
-          initializationResult: async () => ({
-            models: [
-              {
-                value: "default",
-                displayName: "Default",
-                description: "Opus",
-                supportsEffort: true,
-                supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-              },
-            ],
-          }),
-        }) as any;
-      });
+      mockQuery();
 
       const { ClaudeAcpAgent } = await import("../acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
@@ -1072,21 +1078,7 @@ describe("ClaudeAcpAgent settings", () => {
       );
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
-      querySpy.mockImplementation(() => {
-        return makeMockQuery({
-          initializationResult: async () => ({
-            models: [
-              {
-                value: "default",
-                displayName: "Default",
-                description: "Opus",
-                supportsEffort: true,
-                supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
-              },
-            ],
-          }),
-        }) as any;
-      });
+      mockQuery();
 
       const { ClaudeAcpAgent } = await import("../acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
