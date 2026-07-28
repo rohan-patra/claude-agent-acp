@@ -124,20 +124,6 @@ Plan files and other context artifacts are stored in `.context/` within the proj
 - **Fast mode toggle** — When the model supports it, an Off/Fast toggle appears. Server-side transitions (e.g., cooldown) are synced back to the UI.
 - **Ultracode** — When the model is xhigh-capable (e.g. Opus) and the Workflows feature is enabled, an "Ultracode" entry appears at the bottom of the effort/thought-level list. Selecting it turns on the SDK's `ultracode` mode (xhigh effort + standing dynamic-workflow orchestration); selecting any normal effort level turns it back off. It's session-scoped and never persisted.
 
-### Expanded Model Picker
-
-The Claude Agent SDK only exposes a curated set of 4 models to ACP clients (Opus 4.8 1M as "Default", Sonnet, Sonnet 1M, Haiku) — it has no API that lists the version-pinned variants, even though the underlying CLI supports them. This fork surfaces the full Claude Code model picker instead:
-
-- Opus 4.8 1M
-- Opus 4.8
-- Opus 4.7 1M
-- Opus 4.7
-- Opus 4.6 1M
-- Sonnet 4.6
-- Haiku 4.5
-
-Setting an `availableModels` allowlist in `settings.json` overrides this with your own list (unchanged from upstream). See [CLAUDE.md](./CLAUDE.md) for how the list is built and maintained.
-
 ### Patched Claude Agent SDK
 
 This fork depends on a [patched build of the Claude Agent SDK](https://github.com/rohan-patra/claude-agent-sdk-patch) rather than the official npm package (it keeps the same `@anthropic-ai/claude-agent-sdk` name, so it's a drop-in replacement).
@@ -201,11 +187,23 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Following
 - Edit review
 - TODO lists
+- Nested subagent transcripts
 - Interactive (and background) terminals
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
 - Client MCP servers
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
+
+### Nested subagent transcripts
+
+ACP 1.2 has no standard subagent tool kind or nested-message relationship. Clients that can render
+nested transcripts can opt in with `clientCapabilities._meta["subagent-transcript"] = true`.
+The agent then forwards subagent text, thinking, and tool calls, relating nested updates to the
+launching Agent/Task call through `_meta.claudeCode.parentToolUseId`. Agent/Task calls are marked
+with `_meta.claudeCode.subagent = true`.
+
+Clients that do not advertise the capability retain the legacy flattened behavior. In both modes,
+the normal Agent/Task tool result is preserved as the protocol-compatible fallback.
 
 ## Contribution Policy
 
