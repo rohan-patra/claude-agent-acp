@@ -7115,17 +7115,17 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
   // The bare alias doesn't reliably auto-upgrade to the 1M window when set via
   // the SDK's programmatic query()/setModel path (unlike the interactive CLI),
   // so the [1m] suffix is required to get the correct context window.
-  { value: "fable[1m]", displayName: "Fable 5", description: "Fable 5", family: "opus" },
+  { value: "fable[1m]", displayName: "Fable", description: "Latest Fable with 1M context", family: "opus" },
   {
     value: "opus[1m]",
-    displayName: "Opus 5 1M",
-    description: "Opus 5 with 1M context",
+    displayName: "Opus",
+    description: "Latest Opus with 1M context",
     family: "opus",
   },
   {
     value: "sonnet[1m]",
-    displayName: "Sonnet 5 1M",
-    description: "Sonnet 5 with 1M context",
+    displayName: "Sonnet",
+    description: "Latest Sonnet with 1M context",
     family: "sonnet",
   },
   { value: "haiku", displayName: "Haiku 4.5", description: "Haiku 4.5", family: "haiku" },
