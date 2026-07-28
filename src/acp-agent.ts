@@ -7128,7 +7128,7 @@ const FORK_MODEL_PICKER: ReadonlyArray<{
     description: "Latest Sonnet with 1M context",
     family: "sonnet",
   },
-  { value: "haiku", displayName: "Haiku 4.5", description: "Haiku 4.5", family: "haiku" },
+  { value: "haiku", displayName: "Haiku", description: "Latest Haiku", family: "haiku" },
   // Older same-family variants, kept selectable but ranked below their
   // newer sibling and the rest of the picker.
   {

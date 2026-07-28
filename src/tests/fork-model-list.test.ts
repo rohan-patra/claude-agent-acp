@@ -43,7 +43,7 @@ describe("buildForkModelList", () => {
       ["fable[1m]", "Fable"],
       ["opus[1m]", "Opus"],
       ["sonnet[1m]", "Sonnet"],
-      ["haiku", "Haiku 4.5"],
+      ["haiku", "Haiku"],
       ["claude-opus-4-8[1m]", "Opus 4.8 1M"],
       ["claude-opus-4-7[1m]", "Opus 4.7 1M"],
       ["claude-opus-4-6[1m]", "Opus 4.6 1M"],
