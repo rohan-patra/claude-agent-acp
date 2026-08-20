@@ -272,6 +272,8 @@ When pulling changes from `zed-industries/claude-agent-acp`:
 
 4. **`package.json` and `package-lock.json`** — The `@anthropic-ai/claude-agent-sdk` dependency must stay pointed at the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`), **not** the version that upstream's `package.json` declares. When merging an upstream bump, keep our git spec — don't accept upstream's npm version. To track a newer SDK, first advance the patch repo (vendor the new upstream tarball + re-apply the env-normalization patch on its `main`), then bump the pinned SHA here. See the **Modified: `package.json`** section above for the full step-by-step (including the `git checkout --theirs package-lock.json && npm install` shortcut for resolving the lockfile conflict).
 
+5. **CI and release automation** — This fork intentionally has no `.github/workflows/` jobs. Remove workflow files and release-please support files (`release-please-config.json`, `.release-please-manifest.json`, and `scripts/release-preflight.sh`) after upstream merges. Run checks and create `-custom` releases locally.
+
 ## Architecture
 
 ```
@@ -334,9 +336,13 @@ gh release create v<version> --title "v<version>" --generate-notes --repo <owner
 
 ## Testing
 
+This fork has no CI jobs. Run verification locally before pushing or releasing:
+
 ```bash
+npm run format         # Apply Prettier formatting
+npm run check          # ESLint + formatting check
 npm run build          # TypeScript compilation
-npm run test:run       # Unit tests (95 tests)
+npm run test:run       # Unit tests
 npm run test:integration  # Integration tests (requires RUN_INTEGRATION_TESTS=true)
 ```
 

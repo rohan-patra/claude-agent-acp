@@ -160,12 +160,18 @@ Everything else works unchanged:
 
 ## Development
 
+This fork has no CI jobs. Run checks locally before pushing:
+
 ```bash
+npm run format         # Apply Prettier formatting
+npm run check          # ESLint + formatting check
 npm run build          # TypeScript compilation
 npm run test:run       # Unit tests
 npm run dev            # Build + start
 npm run test:integration  # Integration tests (requires RUN_INTEGRATION_TESTS=true)
 ```
+
+Releases are also created locally. See [docs/RELEASES.md](./docs/RELEASES.md).
 
 ## Keeping Up with Upstream
 
@@ -177,6 +183,8 @@ This fork is designed for easy merges. All changes are additive:
 | `src/tools.ts`     | `fs` import, `extractReadContent`, `isToolError`, `FileEditInterceptor` interface + `createFileEditInterceptor` factory appended at EOF, `onFileRead` option added to `createPostToolUseHook`, `.context/` bypass in interceptor, background-task helpers (`RunningTask`, `runningTaskLabel`, `runningTaskPlanEntries`, `buildMergedPlanEntries`, `suppressBackgroundToolResults`)           | Additions at end of file; shouldn't conflict; route new plan emits through the combiner                                                                                                                                                                                              |
 | `src/lib.ts`       | 2 export lines (`createFileEditInterceptor`, `FileEditInterceptor` type) + 5 new exports for background-task helpers                                                                                                                                                                                                                                                                         | Re-add if upstream changes exports                                                                                                                                                                                                                                                   |
 | `package.json`     | `@anthropic-ai/claude-agent-sdk` repointed to the patched fork (`github:rohan-patra/claude-agent-sdk-patch#<sha>`)                                                                                                                                                                                                                                                                           | Keep our git spec on merge — don't accept upstream's npm version; bump the SHA to track a newer SDK. For lockfile conflicts on an SDK bump, `git checkout --theirs package-lock.json && npm install` resolves cleanly. See [CLAUDE.md](./CLAUDE.md) for the full SDK-bump procedure. |
+
+Upstream workflow files under `.github/workflows/` and release-please support files are intentionally omitted. Remove them again after each upstream merge.
 
 See [CLAUDE.md](./CLAUDE.md) for detailed merge instructions and architecture documentation.
 
