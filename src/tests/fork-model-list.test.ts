@@ -60,7 +60,13 @@ describe("buildForkModelList", () => {
 
   it("donates Opus capability flags from the SDK `default` template to every Opus entry", () => {
     const models = buildForkModelList(SDK_MODELS);
-    for (const value of ["fable[1m]", "opus[1m]", "claude-opus-4-8[1m]", "claude-opus-4-7[1m]", "claude-opus-4-6[1m]"]) {
+    for (const value of [
+      "fable[1m]",
+      "opus[1m]",
+      "claude-opus-4-8[1m]",
+      "claude-opus-4-7[1m]",
+      "claude-opus-4-6[1m]",
+    ]) {
       const m = models.find((x) => x.value === value)!;
       expect(m.supportsEffort, value).toBe(true);
       expect(m.supportedEffortLevels, value).toEqual(["low", "medium", "high", "xhigh", "max"]);

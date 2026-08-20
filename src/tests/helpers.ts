@@ -32,6 +32,8 @@ export function makeMockQuery(overrides: Record<string, unknown> = {}) {
     applyFlagSettings: async () => {},
     supportedCommands: async () => [],
     getContextUsage: async () => DEFAULT_CONTEXT_USAGE,
+    close: () => {},
+    interrupt: async () => undefined,
     [Symbol.asyncIterator]: async function* () {},
     ...overrides,
   };
